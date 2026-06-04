@@ -313,9 +313,9 @@ if __name__ == "__main__":
     #            RedisJSON loaded (e.g. Redis Stack); plain Redis OSS
     #            won't work because ``langgraph-checkpoint-redis`` builds
     #            JSON-backed search indices in ``setup()``.
-    AEROSPIKE_URI: str | None = "aerospike://localhost:3000/test"
-    POSTGRES_URI: str | None = "postgresql://user:password@localhost:5432/postgres"
-    REDIS_URI: str | None = "redis://localhost:6379/0"
+    AEROSPIKE_URI: str | None = "aerospike://10.100.0.2:3000/test"
+    POSTGRES_URI: str | None = "postgresql://bench:benchpassword@10.100.0.2:5432/bench"
+    REDIS_URI: str | None = "redis://10.100.0.2:6379/0"
 
     workload = LangGraphIoWorkload(
         aerospike_connection_string=AEROSPIKE_URI,
@@ -324,7 +324,7 @@ if __name__ == "__main__":
     )
 
     runner = BenchmarkRunner(
-        queries_per_second=100,
+        queries_per_second=500,
         scheduler_thread_count=2,
         worker_thread_count=10000,
         runtime_per_function=2,
