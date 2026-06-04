@@ -324,10 +324,10 @@ if __name__ == "__main__":
     )
 
     runner = BenchmarkRunner(
-        queries_per_second=500,
-        scheduler_thread_count=2,
+        queries_per_second=2000,
+        scheduler_thread_count=8,
         worker_thread_count=10000,
-        runtime_per_function=2,
+        runtime_per_function=30,
         workload=workload,
     )
     runner.run()
