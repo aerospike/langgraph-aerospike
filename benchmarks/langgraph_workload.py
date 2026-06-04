@@ -217,9 +217,17 @@ class LangGraphIoWorkload(BaseBenchmarkWorkload):
         self._seed("redis", self._redis_saver)
 
     def _seed(self, backend: str, saver: Any) -> None:
-        """Pre-populate one checkpoint per thread so reads have data."""
+        """Reset prior-run data, then pre-populate one checkpoint per thread.
+
+        The benchmark only ever touches the fixed ``bench-*`` thread pool,
+        so deleting those threads up front gives every run an identical
+        clean slate. Without this, re-runs accumulate checkpoints/writes
+        (and grow Aerospike's per-thread timeline), inflating ``list``
+        latency and making results incomparable across runs.
+        """
         for idx in range(_THREAD_POOL_SIZE):
             thread_id = f"bench-{idx}"
+            saver.delete_thread(thread_id)
             checkpoint = _make_checkpoint()
             saver.put(_cfg(thread_id), checkpoint, {}, {})
             self._latest_checkpoint_id[(backend, idx)] = checkpoint["id"]
@@ -324,9 +332,9 @@ if __name__ == "__main__":
     )
 
     runner = BenchmarkRunner(
-        queries_per_second=2000,
+        queries_per_second=1500,
         scheduler_thread_count=8,
-        worker_thread_count=10000,
+        worker_thread_count=30000,
         runtime_per_function=30,
         workload=workload,
     )
