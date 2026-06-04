@@ -33,7 +33,7 @@ from ai_ecosystem_benchmark import BaseBenchmarkWorkload, BenchmarkRunner
 # backend. Read/list calls round-robin over this pool so concurrent workers
 # touch different rows/keys (avoids artificial single-row contention) while
 # still hitting data that was seeded in ``setup``.
-_THREAD_POOL_SIZE = 16
+_THREAD_POOL_SIZE = 1024
 _CHECKPOINT_NS = "bench"
 
 
@@ -321,9 +321,9 @@ if __name__ == "__main__":
     #            RedisJSON loaded (e.g. Redis Stack); plain Redis OSS
     #            won't work because ``langgraph-checkpoint-redis`` builds
     #            JSON-backed search indices in ``setup()``.
-    AEROSPIKE_URI: str | None = "aerospike://10.100.0.2:3000/test"
-    POSTGRES_URI: str | None = "postgresql://bench:benchpassword@10.100.0.3:5432/bench"
-    REDIS_URI: str | None = "redis://10.100.0.4:6379/0"
+    AEROSPIKE_URI: str | None = "aerospike://10.100.0.4:3000/test"
+    POSTGRES_URI: str | None = "postgresql://bench:benchpassword@10.100.0.2:5432/bench"
+    REDIS_URI: str | None = "redis://10.100.0.5:6379/0"
 
     workload = LangGraphIoWorkload(
         aerospike_connection_string=AEROSPIKE_URI,
@@ -332,9 +332,9 @@ if __name__ == "__main__":
     )
 
     runner = BenchmarkRunner(
-        queries_per_second=1500,
+        queries_per_second=1000,
         scheduler_thread_count=8,
-        worker_thread_count=30000,
+        worker_thread_count=10000,
         runtime_per_function=30,
         workload=workload,
     )
