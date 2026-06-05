@@ -120,27 +120,26 @@ Then set `REDIS_URI = "redis://localhost:6379/0"`.
 
 ## Running the benchmark
 
-1. Open `benchmarks/langgraph_workload.py` and edit the three
-   connection-string constants near the bottom of the file. Set any of
-   them to `None` to disable that backend.
-
-   ```python
-   AEROSPIKE_URI: str | None = "aerospike://localhost:3000/test"
-   POSTGRES_URI: str | None = "postgresql://postgres:password@localhost:5432/postgres"
-   REDIS_URI: str | None = "redis://localhost:6379/0"
-   ```
-
-2. (Optional) Tweak the `BenchmarkRunner` parameters in the same block:
-
-   - `queries_per_second` — total load across all scheduler threads.
-   - `runtime_per_function` — seconds each `<backend>_<op>` method runs.
-   - `worker_thread_count` — concurrency cap for in-flight calls.
-
-3. Run it:
+1. Run it with the default backend URIs:
 
    ```bash
    uv run python benchmarks/langgraph_workload.py
    ```
+
+2. Override backend URIs, load, duration, or connection pool sizes from the CLI:
+
+   ```bash
+   uv run python benchmarks/langgraph_workload.py \
+     --aerospike-uri aerospike://localhost:3000/test \
+     --postgres-uri postgresql://postgres:password@localhost:5432/postgres \
+     --redis-uri redis://localhost:6379/0 \
+     --qps 500 \
+     --worker-thread-count 512 \
+     --postgres-pool-size 64 \
+     --redis-pool-size 256
+   ```
+
+   Pass `none` for a URI to disable that backend.
 
 The output is one block per backend with `p50` / `p90` / `p99` latency
 in milliseconds for each of the four checkpointer operations:
@@ -164,9 +163,9 @@ in milliseconds for each of the four checkpointer operations:
   if the corresponding URI is `None`. To add a new operation, just
   define `<backend>_<op>` for each backend you care about.
 
-- `setup()` pre-seeds 16 checkpoints per enabled backend so that
+- `setup()` pre-seeds 1024 checkpoints per enabled backend so that
   `get_tuple` and `list` always have data to read. Read-side methods
-  round-robin over those 16 thread IDs to avoid artificial single-row
+  round-robin over those thread IDs to avoid artificial single-row
   contention; `put` methods cycle through them too so they don't all
   hammer the same row.
 
@@ -174,8 +173,28 @@ in milliseconds for each of the four checkpointer operations:
   `PostgresSaver.from_conn_string(...)` so concurrent worker threads
   aren't serialised through one connection. The pool is pre-warmed
   with `min_size == max_size` so the connection-establishment cost
-  doesn't leak into the measured latency.
+  doesn't leak into the measured latency. Keep `--postgres-pool-size`
+  below the server's `max_connections` with room for admin sessions.
 
-- Aerospike's client is constructed with `max_conns_per_node = 4096`;
-  the default of 100 is way too small for high `worker_thread_count` +
-  the chatty `list` op (which issues 20+ round-trips per call).
+- Redis uses an explicit `BlockingConnectionPool`. Without a bounded
+  pool, very large worker counts can create enough sockets to hit the
+  process `ulimit -n`, producing `Too many open files` instead of useful
+  benchmark data.
+
+- Treat `worker_thread_count` as the maximum in-flight operation count,
+  not as "more is better". A value like 30000 can overwhelm the Python
+  scheduler, Redis file descriptors, and Postgres connection limits. For
+  a fair comparison, pick a worker count just above
+  `qps * expected_p99_latency_seconds`, then sweep `--qps` upward until
+  a backend saturates. Saturation is the comparison point; client-side
+  warnings or failures are not.
+
+- The built-in pool defaults are conservative starting points, not
+  universal tuning advice. For serious comparison runs, set them
+  explicitly: keep Postgres below `max_connections`, Redis below the
+  client and server file-descriptor budget, and Aerospike high enough to
+  cover the desired in-flight operations.
+
+- Aerospike's client is constructed with a configurable
+  `max_conns_per_node`; the driver default of 100 is often too small for
+  high `worker_thread_count` + the chatty `list` op.

@@ -39,7 +39,12 @@ _DEFAULT_AEROSPIKE_URI = "aerospike://10.100.0.4:3000/test"
 _DEFAULT_POSTGRES_URI = "postgresql://bench:benchpassword@10.100.0.2:5432/bench"
 _DEFAULT_REDIS_URI = "redis://10.100.0.5:6379/0"
 _DEFAULT_QPS = 1000
-_DEFAULT_WORKER_THREAD_COUNT = 10000
+_DEFAULT_WORKER_THREAD_COUNT = 8192
+_DEFAULT_SCHEDULER_THREAD_COUNT = 8
+_DEFAULT_RUNTIME_PER_FUNCTION = 30
+_DEFAULT_AEROSPIKE_MAX_CONNS = 1024
+_DEFAULT_POSTGRES_POOL_SIZE = 64
+_DEFAULT_REDIS_POOL_SIZE = 256
 
 
 def _optional_uri(value: str) -> str | None:
@@ -96,6 +101,36 @@ def _parse_args() -> argparse.Namespace:
         default=_DEFAULT_WORKER_THREAD_COUNT,
         help="Worker thread count used by the benchmark runner. Defaults to %(default)s.",
     )
+    parser.add_argument(
+        "--scheduler-thread-count",
+        type=_positive_int,
+        default=_DEFAULT_SCHEDULER_THREAD_COUNT,
+        help="Scheduler thread count used by the benchmark runner. Defaults to %(default)s.",
+    )
+    parser.add_argument(
+        "--runtime-per-function",
+        type=_positive_int,
+        default=_DEFAULT_RUNTIME_PER_FUNCTION,
+        help="Seconds to run each benchmark method. Defaults to %(default)s.",
+    )
+    parser.add_argument(
+        "--aerospike-max-conns",
+        type=_positive_int,
+        default=_DEFAULT_AEROSPIKE_MAX_CONNS,
+        help="Aerospike max_conns_per_node for the benchmark client. Defaults to %(default)s.",
+    )
+    parser.add_argument(
+        "--postgres-pool-size",
+        type=_positive_int,
+        default=_DEFAULT_POSTGRES_POOL_SIZE,
+        help="Pre-warmed psycopg connection pool size. Defaults to %(default)s.",
+    )
+    parser.add_argument(
+        "--redis-pool-size",
+        type=_positive_int,
+        default=_DEFAULT_REDIS_POOL_SIZE,
+        help="Redis BlockingConnectionPool max connection count. Defaults to %(default)s.",
+    )
     return parser.parse_args()
 
 
@@ -146,12 +181,19 @@ class LangGraphIoWorkload(BaseBenchmarkWorkload):
         aerospike_connection_string: str | None = None,
         postgres_connection_string: str | None = None,
         redis_connection_string: str | None = None,
+        aerospike_max_conns: int = _DEFAULT_AEROSPIKE_MAX_CONNS,
+        postgres_pool_size: int = _DEFAULT_POSTGRES_POOL_SIZE,
+        redis_pool_size: int = _DEFAULT_REDIS_POOL_SIZE,
     ) -> None:
         super().__init__(
             aerospike_connection_string=aerospike_connection_string,
             postgres_connection_string=postgres_connection_string,
             redis_connection_string=redis_connection_string,
         )
+        self._aerospike_max_conns = aerospike_max_conns
+        self._postgres_pool_size = postgres_pool_size
+        self._redis_pool_size = redis_pool_size
+
         # ``itertools.count`` is atomic in CPython so worker threads can
         # bump these without an extra lock.
         self._round_robin = count()
@@ -166,9 +208,9 @@ class LangGraphIoWorkload(BaseBenchmarkWorkload):
         self._postgres_pool: Any | None = None
         self._postgres_saver: Any | None = None
 
-        # ``from_conn_string`` is a context manager; we keep the live
-        # context around so we can ``__exit__`` it in ``teardown``.
-        self._redis_ctx: Any | None = None
+        # RedisSaver can build its own unbounded client, but benchmark runs
+        # need an explicit pool so the client cannot exhaust file handles.
+        self._redis_client: Any | None = None
         self._redis_saver: Any | None = None
 
         # ``(backend, thread_idx) -> latest checkpoint_id``. Refreshed on
@@ -195,8 +237,13 @@ class LangGraphIoWorkload(BaseBenchmarkWorkload):
                 self._aerospike_client.close()
         if self._postgres_pool is not None:
             self._postgres_pool.close()
-        if self._redis_ctx is not None:
-            self._redis_ctx.__exit__(None, None, None)
+        if self._redis_client is not None:
+            with suppress(Exception):
+                self._redis_client.close()
+            connection_pool = getattr(self._redis_client, "connection_pool", None)
+            if connection_pool is not None:
+                with suppress(Exception):
+                    connection_pool.disconnect()
 
     # ---------- per-backend setup ----------
 
@@ -227,7 +274,7 @@ class LangGraphIoWorkload(BaseBenchmarkWorkload):
         self._aerospike_client = aerospike.client(
             {
                 "hosts": [(host, port)],
-                "max_conns_per_node": 4096,
+                "max_conns_per_node": self._aerospike_max_conns,
             }
         ).connect()
         self._aerospike_saver = AerospikeSaver(client=self._aerospike_client, namespace=namespace)
@@ -254,11 +301,10 @@ class LangGraphIoWorkload(BaseBenchmarkWorkload):
         # full pool before the benchmark starts; otherwise on-demand
         # connection growth (TCP + TLS + Postgres handshake, serialised
         # by the pool's grow worker) leaks into the measured latency.
-        pool_size = 64
         self._postgres_pool = ConnectionPool(
             self.postgres_connection_string,
-            min_size=pool_size,
-            max_size=pool_size,
+            min_size=self._postgres_pool_size,
+            max_size=self._postgres_pool_size,
             kwargs={"autocommit": True, "row_factory": dict_row},
             open=True,
         )
@@ -270,10 +316,19 @@ class LangGraphIoWorkload(BaseBenchmarkWorkload):
 
     def _setup_redis(self) -> None:
         from langgraph.checkpoint.redis import RedisSaver
+        from redis import BlockingConnectionPool, Redis
 
         assert self.redis_connection_string is not None
-        self._redis_ctx = RedisSaver.from_conn_string(self.redis_connection_string)
-        self._redis_saver = self._redis_ctx.__enter__()
+        # redis-py's default pool can grow very large under a huge worker
+        # pool. Bound it explicitly so benchmark pressure shows up as Redis
+        # latency instead of OS-level "too many open files" failures.
+        redis_pool = BlockingConnectionPool.from_url(
+            self.redis_connection_string,
+            max_connections=self._redis_pool_size,
+            timeout=30,
+        )
+        self._redis_client = Redis(connection_pool=redis_pool)
+        self._redis_saver = RedisSaver(redis_client=self._redis_client)
         # Creates RediSearch indices used for ``list`` / filtered queries.
         self._redis_saver.setup()
         self._seed("redis", self._redis_saver)
@@ -378,13 +433,16 @@ if __name__ == "__main__":
         aerospike_connection_string=args.aerospike_uri,
         postgres_connection_string=args.postgres_uri,
         redis_connection_string=args.redis_uri,
+        aerospike_max_conns=args.aerospike_max_conns,
+        postgres_pool_size=args.postgres_pool_size,
+        redis_pool_size=args.redis_pool_size,
     )
 
     runner = BenchmarkRunner(
         queries_per_second=args.qps,
-        scheduler_thread_count=8,
+        scheduler_thread_count=args.scheduler_thread_count,
         worker_thread_count=args.worker_thread_count,
-        runtime_per_function=30,
+        runtime_per_function=args.runtime_per_function,
         workload=workload,
     )
     runner.run()
