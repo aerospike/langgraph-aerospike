@@ -9,17 +9,17 @@ supported backend:
 - ``postgres``  -> ``langgraph.checkpoint.postgres.PostgresSaver``
 - ``redis``     -> ``langgraph.checkpoint.redis.RedisSaver``
 
-Edit the ``AEROSPIKE_URI`` / ``POSTGRES_URI`` / ``REDIS_URI`` constants at
-the bottom of the file and run::
+Run with the default backend URIs and benchmark settings::
 
     uv run python benchmarks/langgraph_workload.py
 
-Set any URI to ``None`` to disable that backend; the framework will simply
-skip it.
+Override connection URIs, QPS, or worker count with CLI flags. Pass ``none``
+for any URI to disable that backend; the framework will simply skip it.
 """
 
 from __future__ import annotations
 
+import argparse
 import urllib.parse
 import uuid
 from contextlib import suppress
@@ -35,6 +35,68 @@ from ai_ecosystem_benchmark import BaseBenchmarkWorkload, BenchmarkRunner
 # still hitting data that was seeded in ``setup``.
 _THREAD_POOL_SIZE = 1024
 _CHECKPOINT_NS = "bench"
+_DEFAULT_AEROSPIKE_URI = "aerospike://10.100.0.4:3000/test"
+_DEFAULT_POSTGRES_URI = "postgresql://bench:benchpassword@10.100.0.2:5432/bench"
+_DEFAULT_REDIS_URI = "redis://10.100.0.5:6379/0"
+_DEFAULT_QPS = 1000
+_DEFAULT_WORKER_THREAD_COUNT = 10000
+
+
+def _optional_uri(value: str) -> str | None:
+    stripped = value.strip()
+    if stripped.lower() in {"", "none", "null", "disabled"}:
+        return None
+    return stripped
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Benchmark LangGraph checkpointer IO patterns against configured backends."
+    )
+    parser.add_argument(
+        "--aerospike-uri",
+        type=_optional_uri,
+        default=_DEFAULT_AEROSPIKE_URI,
+        help=(
+            "Aerospike URI: host:port[/namespace] or aerospike://host:port[/namespace]. "
+            "Pass 'none' to disable. Defaults to %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--postgres-uri",
+        type=_optional_uri,
+        default=_DEFAULT_POSTGRES_URI,
+        help="Postgres libpq URI. Pass 'none' to disable. Defaults to %(default)s.",
+    )
+    parser.add_argument(
+        "--redis-uri",
+        type=_optional_uri,
+        default=_DEFAULT_REDIS_URI,
+        help=(
+            "Redis URI. Requires Redis Stack/RediSearch + RedisJSON. "
+            "Pass 'none' to disable. Defaults to %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--qps",
+        type=_positive_int,
+        default=_DEFAULT_QPS,
+        help="Target queries per second. Defaults to %(default)s.",
+    )
+    parser.add_argument(
+        "--worker-thread-count",
+        type=_positive_int,
+        default=_DEFAULT_WORKER_THREAD_COUNT,
+        help="Worker thread count used by the benchmark runner. Defaults to %(default)s.",
+    )
+    return parser.parse_args()
 
 
 def _make_checkpoint() -> dict[str, Any]:
@@ -310,31 +372,18 @@ class LangGraphIoWorkload(BaseBenchmarkWorkload):
 
 
 if __name__ == "__main__":
-    # Edit these to point at the backends you want to benchmark. Set any
-    # of them to ``None`` to disable that backend (the framework simply
-    # skips backends with no connection string).
-    #
-    # Aerospike: ``host:port[/<namespace>]`` or ``aerospike://host:port[/<namespace>]``.
-    #            ``<namespace>`` defaults to ``test`` if omitted.
-    # Postgres : standard libpq URI.
-    # Redis    : standard ``redis://`` URI. Server must have RediSearch +
-    #            RedisJSON loaded (e.g. Redis Stack); plain Redis OSS
-    #            won't work because ``langgraph-checkpoint-redis`` builds
-    #            JSON-backed search indices in ``setup()``.
-    AEROSPIKE_URI: str | None = "aerospike://10.100.0.4:3000/test"
-    POSTGRES_URI: str | None = "postgresql://bench:benchpassword@10.100.0.2:5432/bench"
-    REDIS_URI: str | None = "redis://10.100.0.5:6379/0"
+    args = _parse_args()
 
     workload = LangGraphIoWorkload(
-        aerospike_connection_string=AEROSPIKE_URI,
-        postgres_connection_string=POSTGRES_URI,
-        redis_connection_string=REDIS_URI,
+        aerospike_connection_string=args.aerospike_uri,
+        postgres_connection_string=args.postgres_uri,
+        redis_connection_string=args.redis_uri,
     )
 
     runner = BenchmarkRunner(
-        queries_per_second=1000,
+        queries_per_second=args.qps,
         scheduler_thread_count=8,
-        worker_thread_count=10000,
+        worker_thread_count=args.worker_thread_count,
         runtime_per_function=30,
         workload=workload,
     )
