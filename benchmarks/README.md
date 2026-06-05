@@ -120,7 +120,7 @@ Then set `REDIS_URI = "redis://localhost:6379/0"`.
 
 ## Running the benchmark
 
-1. Open `benchmarks/langgraph_workload.py` and edit the three
+1. Open `benchmarks/langgraph_checkpoint_workload.py` and edit the three
    connection-string constants near the bottom of the file. Set any of
    them to `None` to disable that backend.
 
@@ -139,7 +139,7 @@ Then set `REDIS_URI = "redis://localhost:6379/0"`.
 3. Run it:
 
    ```bash
-   uv run python benchmarks/langgraph_workload.py
+   uv run python benchmarks/langgraph_checkpoint_workload.py
    ```
 
 The output is one block per backend with `p50` / `p90` / `p99` latency
