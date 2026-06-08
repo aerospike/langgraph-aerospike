@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "langgraph-checkpoint-aerospike"
-version = "0.2.0"
+version = "0.2.1"
 description = "Aerospike-based checkpoint saver for LangGraph"
 readme = "README.md"
 requires-python = ">=3.10"

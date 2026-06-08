@@ -2,7 +2,7 @@
 name = "aerospike-langgraph"
 # The root project is not published to PyPI, but it tracks the coordinated
 # release version because the workspace packages are released together.
-version = "0.2.0"
+version = "0.2.1"
 description = "Monorepo root for the aerospike-langgraph packages"
 requires-python = ">=3.10"
 
