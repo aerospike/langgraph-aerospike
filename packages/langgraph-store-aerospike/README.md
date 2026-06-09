@@ -22,45 +22,57 @@ docker run -d --name aerospike -p 3000-3002:3000-3002 container.aerospike.com/ae
    - `AEROSPIKE_NAMESPACE=langgraph` (default namespace for the store)
    - `AEROSPIKE_SET=store` (default set name)
 
-3. Use in your application:
+3. Compile a LangGraph graph with the store. Nodes reach it through
+   `get_store()`, so the same long-term memory is shared across every run and
+   every thread (unlike a checkpointer, which is scoped to a single thread):
 
 ```python
-   import aerospike
-   from langgraph.store.aerospike import AerospikeStore
-   from langgraph.store.base import PutOp, GetOp, SearchOp
+from typing import TypedDict
 
-   client = aerospike.client({"hosts": [("127.0.0.1", 3000)]}).connect()
+import aerospike
+from langgraph.config import get_store
+from langgraph.graph import START, END, StateGraph
 
-   store = AerospikeStore(
-       client=client,
-       namespace="test",
-       set="langgraph_store"
-   )
-   store.put(
-       namespace=("users", "profiles"),
-       key="user_123",
-       value={"name": "Alice", "age": 30}
-   )
+from langgraph.store.aerospike import AerospikeStore
 
-   # Get data
-   item = store.get(namespace=("users", "profiles"), key="user_123")
-   print(item.value)  # {"name": "Alice", "age": 30}
+# 1. Connect to Aerospike and build the store.
+client = aerospike.client({"hosts": [("127.0.0.1", 3000)]}).connect()
+store = AerospikeStore(client=client, namespace="test", set="langgraph_store")
 
-   # Batch operations
-   ops = [
-       PutOp(namespace=("documents",), key="doc1", value={"status": "draft"}),
-       PutOp(namespace=("documents",), key="doc2", value={"status": "published"}),
-       GetOp(namespace=("documents",), key="doc1"),
-   ]
-   results = store.batch(ops)
+# 2. Define a graph whose node reads and writes long-term memory.
+class State(TypedDict):
+    user_id: str
+    food: str
 
-   # Search with filters
-   search_results = store.search(
-       namespace_prefix=("documents",),
-       filter={"status": {"$eq": "draft"}},
-       limit=10
-   )
+def remember_preference(state: State) -> State:
+    store = get_store()
+    namespace = ("users", state["user_id"])
 
-   # Delete item
-   store.delete(namespace=("users", "profiles"), key="user_123")
+    # Persist something we learned about this user.
+    store.put(namespace, key="profile", value={"favorite_food": state["food"]})
+
+    # Read it back (would also be visible in any future run / thread).
+    profile = store.get(namespace, key="profile")
+    print(profile.value)  # {"favorite_food": "pizza"}
+    return state
+
+builder = StateGraph(State)
+builder.add_node("remember_preference", remember_preference)
+builder.add_edge(START, "remember_preference")
+builder.add_edge("remember_preference", END)
+
+# 3. Compile with the Aerospike store and run.
+graph = builder.compile(store=store)
+graph.invoke({"user_id": "user_123", "food": "pizza"})
+```
+
+The store is also a standalone `BaseStore`, so you can use it directly outside a
+graph for the same cross-thread memory:
+
+```python
+# Search within a namespace prefix, filtering on stored fields.
+results = store.search(("users",), filter={"favorite_food": "pizza"}, limit=10)
+
+# Delete an item.
+store.delete(("users", "user_123"), key="profile")
 ```
