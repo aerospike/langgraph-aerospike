@@ -573,6 +573,7 @@ class LangGraphIoWorkload(BaseBenchmarkWorkload):
             }
         ).connect()
         self._aerospike_saver = AerospikeSaver(client=self._aerospike_client, namespace=namespace)
+        self._truncate_aerospike(self._aerospike_client, namespace, self._aerospike_saver)
         self._aerospike_graph_sequential = self._build_sequential_graph(self._aerospike_saver)
         self._aerospike_graph_fanout = self._build_fanout_graph(self._aerospike_saver)
         self._aerospike_graph_resume = self._build_resume_graph(self._aerospike_saver)
@@ -611,6 +612,7 @@ class LangGraphIoWorkload(BaseBenchmarkWorkload):
         self._postgres_saver = PostgresSaver(self._postgres_pool)
         # Idempotent migration step; required on first use of a fresh DB.
         self._postgres_saver.setup()
+        self._truncate_postgres(self._postgres_pool)
         self._postgres_graph_sequential = self._build_sequential_graph(self._postgres_saver)
         self._postgres_graph_fanout = self._build_fanout_graph(self._postgres_saver)
         self._postgres_graph_resume = self._build_resume_graph(self._postgres_saver)
@@ -631,6 +633,9 @@ class LangGraphIoWorkload(BaseBenchmarkWorkload):
             timeout=30,
         )
         self._redis_client = Redis(connection_pool=redis_pool)
+        # Drop all prior-run keys (and RediSearch indices) before the saver
+        # rebuilds its indices, so every run starts from an empty DB.
+        self._truncate_redis(self._redis_client)
         self._redis_saver = RedisSaver(redis_client=self._redis_client)
         # Creates RediSearch indices used for ``list`` / filtered queries.
         self._redis_saver.setup()
@@ -640,18 +645,53 @@ class LangGraphIoWorkload(BaseBenchmarkWorkload):
         self._redis_graph_cyclic = self._build_cyclic_graph(self._redis_saver)
         self._seed("redis", self._redis_saver)
 
-    def _seed(self, backend: str, saver: Any) -> None:
-        """Reset prior-run data, then pre-populate one checkpoint per thread.
+    # ---------- per-backend truncation ----------
 
-        The benchmark only ever touches the fixed ``bench-*`` thread pool,
-        so deleting those threads up front gives every run an identical
-        clean slate. Without this, re-runs accumulate checkpoints/writes
-        (and grow Aerospike's per-thread timeline), inflating ``list``
-        latency and making results incomparable across runs.
+    def _truncate_aerospike(self, client: Any, namespace: str, saver: Any) -> None:
+        """Server-side truncate of every set the saver writes to.
+
+        ``client.truncate`` is the idiomatic Aerospike wipe: one op per set,
+        no per-record round-trips. Secondary indexes survive truncate, so the
+        ``thread_id`` index created in ``AerospikeSaver.__init__`` stays valid.
+        """
+        import aerospike.exception
+
+        for set_name in (saver.set_cp, saver.set_writes, saver.set_meta):
+            with suppress(aerospike.exception.AerospikeError):
+                client.truncate(namespace, set_name, 0)
+
+    def _truncate_postgres(self, pool: Any) -> None:
+        """Wipe the LangGraph checkpoint tables, preserving the schema.
+
+        Truncates data rows only; the ``checkpoint_migrations`` table (schema
+        versioning) is left intact so ``PostgresSaver.setup()`` stays a no-op
+        on the next run. ``RESTART IDENTITY CASCADE`` clears any sequences and
+        dependent rows in one statement.
+        """
+        with pool.connection() as conn:
+            conn.execute(
+                "TRUNCATE checkpoints, checkpoint_blobs, checkpoint_writes RESTART IDENTITY CASCADE"
+            )
+
+    def _truncate_redis(self, client: Any) -> None:
+        """Flush the selected Redis logical DB (keys + RediSearch indices).
+
+        ``FLUSHDB`` drops every key and index in the connection's DB, so the
+        subsequent ``RedisSaver.setup()`` rebuilds its RediSearch indices from
+        a clean slate.
+        """
+        client.flushdb()
+
+    def _seed(self, backend: str, saver: Any) -> None:
+        """Pre-populate one checkpoint per thread on a freshly truncated DB.
+
+        The per-backend truncation in ``_setup_*`` already wipes all prior-run
+        data (raw ``bench-*`` threads plus the per-invocation graph threads),
+        so this only has to lay down the fixed ``bench-*`` corpus the read /
+        list / put_writes methods round-robin over.
         """
         for idx in range(_THREAD_POOL_SIZE):
             thread_id = f"bench-{idx}"
-            saver.delete_thread(thread_id)
             checkpoint = _make_checkpoint()
             saver.put(_cfg(thread_id), checkpoint, {}, {})
             self._latest_checkpoint_id[(backend, idx)] = checkpoint["id"]
