@@ -78,7 +78,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aerospike", specifier = ">=19.2.1" },
-    { name = "ai-ecosystem-benchmark", specifier = "==0.0.1" },
+    { name = "ai-ecosystem-benchmark", specifier = "==0.0.2" },
     { name = "langchain-core", specifier = ">=1.3.0" },
     { name = "langgraph-checkpoint", specifier = ">=4.1.1" },
     { name = "langgraph-checkpoint-aerospike", editable = "packages/langgraph-checkpoint-aerospike" },
@@ -100,11 +100,11 @@ dev = [
 
 [[package]]
 name = "ai-ecosystem-benchmark"
-version = "0.0.1"
+version = "0.0.2"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/26/cb/326335c554955f52013bb799176faa1ca0b4da9b8a349673b884cd7f3154/ai_ecosystem_benchmark-0.0.1.tar.gz", hash = "sha256:d336b2738e7c73bf656819ac14c0266d1bc904d79df566bc93caba084f5ce320", size = 17079, upload-time = "2026-06-03T20:40:42.819Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/54/fd6f2523a4b8af7ebe1f3a3986f29584e7a917e49cca3de95e05c5d81eb3/ai_ecosystem_benchmark-0.0.2.tar.gz", hash = "sha256:0acafe31502e63b08d54853d05a777888c6d62fdee00db4281bb322b4157d7aa", size = 22152, upload-time = "2026-06-10T22:25:38.434Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/49/1c/772cdeca5ad38201d28bfdbf8847c9c1ebec0b33370f4caed1934382d521/ai_ecosystem_benchmark-0.0.1-py3-none-any.whl", hash = "sha256:e6ccf7e74743d0c2757475a70ed5bf8fa06ddd02ba5ec8759b822e051ae59269", size = 12776, upload-time = "2026-06-03T20:40:41.735Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/1f/3a9e435bb760db3b95ccb15f6c5233f0cacd7f68a7a9fa269be42c6b80aa/ai_ecosystem_benchmark-0.0.2-py3-none-any.whl", hash = "sha256:cf52759f10d8330cc6d7b4d537350b88e315084f8ea176fcdbdb31b7b9b8c792", size = 16127, upload-time = "2026-06-10T22:25:37.311Z" },
 ]
 
 [[package]]
