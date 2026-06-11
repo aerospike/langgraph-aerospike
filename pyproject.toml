@@ -6,7 +6,7 @@ requires-python = ">=3.10"
 
 dependencies = [
   "aerospike>=19.2.1",
-  "ai-ecosystem-benchmark==0.0.2",
+  "ai-ecosystem-benchmark==0.0.3",
   "langchain-core>=1.3.0",
   "langgraph-checkpoint>=4.1.1",
   "langgraph-checkpoint-aerospike",
