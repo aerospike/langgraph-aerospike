@@ -189,7 +189,7 @@ above it. Edit those constants to match your environment.
 
 ---
 
-## Step 5 — Configure the checkpointer with a TTL  ⭐
+## Step 5 — Configure the checkpointer with a TTL
 
 **What this step does:** This is the heart of the cookbook. We create an
 `AerospikeSaver` and pass it a `ttl` dict. From this point on, *every* checkpoint
@@ -275,7 +275,10 @@ def _checkpoint_ttl_seconds(
         return None
     conf = tpl.config["configurable"]
     key = saver._key_cp(conf["thread_id"], conf["checkpoint_ns"], conf["checkpoint_id"])
-    _, meta, _ = client.get(key)
+    try:
+        _, meta, _ = client.get(key)
+    except aerospike.exception.RecordNotFound:
+        return None
     ttl = meta.get("ttl")
     return ttl if isinstance(ttl, int) else None
 ```
@@ -357,7 +360,7 @@ Phase 2 - Start a chat session
   user      > Hello, I need help with my order.
   assistant > Hi! I'm your support assistant. How can I help?
   messages stored  : 2
-  checkpoint TTL   : 53 seconds (set natively by Aerospike)
+  checkpoint TTL   : 60 seconds (set natively by Aerospike)
 
 ================================================================
 Phase 3 - Resume the same thread
@@ -387,9 +390,10 @@ Result
   No cron job, no sweeper, no DELETE query.
 ```
 
-The message count is the easiest proof: the resumed session has `4` messages
-(Step 8), while the post-expiry session has only `2` (Step 9) because the
-previous checkpoints are gone.
+The exact TTL seconds can vary slightly by server timing. The message count is
+the easiest proof: the resumed session has `4` messages (Step 8), while the
+post-expiry session has only `2` (Step 9) because the previous checkpoints are
+gone.
 
 ## Files
 
