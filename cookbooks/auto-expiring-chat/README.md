@@ -14,14 +14,28 @@ DELETE FROM checkpoints WHERE updated_at < NOW() - INTERVAL '7 days';
 ```
 
 Aerospike does this at the record level. Each checkpoint record can carry a
-**Time-To-Live (TTL)**, and Aerospike reclaims it automatically when it expires.
-No sweeper process, no cron job, no cleanup query.
+time to live (TTL), and Aerospike reclaims it automatically when it expires.
+No sweeper process, no cron job, and no cleanup query.
 
-## How To Use This Cookbook
+## Prerequisites
 
-This is a build-along tutorial. Each step below explains **what** you are
-implementing and **why**, shows the code for that step, and then points to the
-exact place in the finished files (`agent.py` and `demo.py`) that implements it.
+Before you start, confirm you have:
+
+| Component | Requirement |
+|-----------|-------------|
+| Python | 3.10 or newer |
+| [uv](https://docs.astral.sh/uv/) | Installed (repo uses `uv run` for cookbook scripts) |
+| Aerospike Database | Running and reachable on port 3000 (local or remote) |
+| This repo | Cloned; dependencies installed with `uv sync` from the repo root |
+
+No LLM API keys are required. The agent uses LangChain's `FakeListChatModel` for
+deterministic output.
+
+## How to use this cookbook
+
+This is a build-along tutorial. Each step explains what you are implementing and
+why, shows the code for that step, and then points to the exact place in the
+finished files (`agent.py` and `demo.py`) that implements it.
 
 You can either write the code yourself as you read, or open the two finished
 files side by side and follow along. The two files are the reference
@@ -56,16 +70,12 @@ demo.py
     └── Step 9:  wait, verify expiry, third _say() call (fresh start)
 ```
 
-No LLM setup is required. The agent uses LangChain's `FakeListChatModel`, so the
-example is deterministic and needs no API keys, Ollama, or provider access. This
-cookbook also assumes you already have an Aerospike server running and reachable.
-
 ---
 
 ## Step 1 — Define the conversation state
 
 **What this step does:** Every LangGraph graph operates on a shared state
-object. For a chat agent, that state is the running list of messages. We use the
+object. For a chat agent, that state is the running list of messages. Use the
 `add_messages` reducer so each turn *appends* to the history instead of
 replacing it — this is what lets a checkpoint accumulate a real conversation.
 
@@ -78,7 +88,7 @@ class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 ```
 
-**In the code:** `agent.py`, marked `# === Step 1 ===` above `class ChatState`.
+**In the code:** `agent.py`, marked `# === Step 1 ===` immediately before `class ChatState`.
 The `Annotated[list[BaseMessage], add_messages]` annotation is the entire reason
 resuming a thread grows the message count instead of overwriting it.
 
@@ -87,11 +97,11 @@ resuming a thread grows the message count instead of overwriting it.
 ## Step 2 — Create the model and the chat node
 
 **What this step does:** A LangGraph node is a function that takes the current
-state and returns an update. Ours sends the conversation to a model and appends
-the reply. We split this into two pieces in `agent.py`:
+state and returns an update. The `chatbot` node sends the conversation to a model
+and appends the reply. Split this into two pieces in `agent.py`:
 
-1. **`_make_llm()`** — creates the model (we use `FakeListChatModel` with
-   scripted replies so the demo needs no API key).
+1. **`_make_llm()`** — creates the model (the demo uses `FakeListChatModel` with
+   scripted replies so you need no API key).
 2. **`chatbot`** — the node function that calls the model. It lives *inside*
    `build_chat_graph()` because it closes over `llm`.
 
@@ -119,7 +129,7 @@ def build_chat_graph(checkpointer: BaseCheckpointSaver) -> CompiledStateGraph:
         system = SystemMessage(content="You are a concise, helpful support assistant.")
         response: AIMessage = llm.invoke([system, *state["messages"]])
         return {"messages": [response]}
-    # ... Step 3 continues below
+    # ... Step 3 continues in the next section
 ```
 
 **In the code:** open `agent.py` and search for `Step 2`. You will find
@@ -130,15 +140,15 @@ node returns only the *new* message; `add_messages` from Step 1 merges it into t
 history. Returning the generic `BaseChatModel` is what makes the model a clean swap
 point — only the body of `_make_llm()` changes when you switch providers.
 
-> Swapping in a real model is a one-line change — replace the body of
-> `_make_llm()` with, for example, `ChatOpenAI(model="gpt-4o-mini")`. The graph
-> shape and the Aerospike behavior are identical.
+> **Tip:** To use a real model, replace the body of `_make_llm()` with, for
+> example, `ChatOpenAI(model="gpt-4o-mini")`. The graph shape and the Aerospike
+> behavior stay the same.
 
 ---
 
 ## Step 3 — Build and compile the graph
 
-**What this step does:** Still inside `build_chat_graph()`, we wire the `chatbot`
+**What this step does:** Still inside `build_chat_graph()`, wire the `chatbot`
 node from Step 2 into a graph (`START → chatbot → END`) and compile it. The key
 argument is `checkpointer=`: this is where persistence plugs in. The graph does
 not know or care that the checkpointer is Aerospike-backed.
@@ -164,10 +174,10 @@ a parameter so `demo.py` can supply an Aerospike-backed one in Step 5.
 
 ## Step 4 — Connect to Aerospike
 
-**What this step does:** Before we can persist anything we need a client
-connected to the Aerospike server. Connection settings live as typed constants at
-the top of `demo.py`. We wrap the client in a context manager so the connection
-is always closed, and turn a connection failure into a clear, actionable message.
+**What this step does:** Before you can persist anything, connect a client to the
+Aerospike server. Connection settings live as typed constants at the top of
+`demo.py`. Wrap the client in a context manager so the connection is always
+closed, and turn a connection failure into a clear, actionable message.
 
 ```python
 AEROSPIKE_HOST: str = "127.0.0.1"
@@ -184,16 +194,16 @@ def _connect() -> Iterator[aerospike.Client]:
 ```
 
 **In the code:** `demo.py`, marked `# === Step 4 ===` (`_connect()`), with the
-`AEROSPIKE_HOST` / `AEROSPIKE_PORT` / `AEROSPIKE_NAMESPACE` constants directly
-above it. Edit those constants to match your environment.
+`AEROSPIKE_HOST` / `AEROSPIKE_PORT` / `AEROSPIKE_NAMESPACE` constants in the
+same section. Edit those constants to match your environment.
 
 ---
 
 ## Step 5 — Configure the checkpointer with a TTL
 
-**What this step does:** This is the heart of the cookbook. We create an
+**What this step does:** Configure checkpoint expiration. Create an
 `AerospikeSaver` and pass it a `ttl` dict. From this point on, *every* checkpoint
-the graph writes is stamped with an expiration, and Aerospike will delete it
+the graph writes is stamped with an expiration, and Aerospike deletes it
 automatically when the time elapses.
 
 ```python
@@ -212,14 +222,14 @@ def _build_checkpointer(client: aerospike.Client) -> AerospikeSaver:
 ```
 
 **In the code:** `demo.py`, marked `# === Step 5 ===` (`_build_checkpointer()`),
-driven by the `CHAT_TTL_MINUTES` and `CHAT_REFRESH_ON_READ` constants directly
-above it. Two fields control everything:
+driven by the `CHAT_TTL_MINUTES` and `CHAT_REFRESH_ON_READ` constants in the
+same section. Two fields control everything:
 
-- `default_ttl` — retention in **whole minutes**. The cookbook uses `1` so you
+- `default_ttl` — retention in whole minutes. The cookbook uses `1` so you
   can watch expiry happen; production is typically hours or days.
 - `refresh_on_read` — when `True`, reading a checkpoint resets its TTL (sliding
-  expiration, so active chats stay alive). We keep it `False` here so the TTL
-  actually counts down while we wait.
+  expiration, so active chats stay alive). Keep it `False` here so the TTL
+  counts down while you wait for Step 9.
 
 Internally the saver translates `default_ttl` into an Aerospike write policy, so
 the TTL lands on every checkpoint, pending-write, and metadata record it creates.
@@ -228,7 +238,7 @@ the TTL lands on every checkpoint, pending-write, and metadata record it creates
 
 ## Step 6 — Run one chat turn and persist it
 
-**What this step does:** We combine the graph (Steps 1–3) with the TTL
+**What this step does:** Combine the graph (Steps 1–3) with the TTL
 checkpointer (Step 5), then invoke the graph with a `thread_id`. The `thread_id`
 is the identity of the conversation — it is the key under which Aerospike stores
 this thread's checkpoints.
@@ -253,7 +263,7 @@ with _connect() as client:
 ```
 
 **In the code:** `demo.py`, marked `# === Step 6 ===` (`_say()`), with the
-wiring in `main()` just below the `with _connect()` block. After this first turn
+wiring in `main()` immediately after the `with _connect()` block. After this first turn
 the thread has 2 messages (your input + the reply).
 
 ---
@@ -285,7 +295,7 @@ def _checkpoint_ttl_seconds(
 
 **In the code:** `demo.py`, marked `# === Step 7 ===` (`_checkpoint_ttl_seconds()`).
 It returns the seconds remaining, or `None` once the record no longer exists —
-which is exactly how we detect expiry in Step 9.
+which is how you detect expiry in Step 9.
 
 ---
 
@@ -308,7 +318,7 @@ state was loaded from Aerospike.
 
 ## Step 9 — Wait for expiry and prove the state is gone
 
-**What this step does:** We wait just past the TTL window, then check the same
+**What this step does:** Wait past the TTL window, then check the same
 thread. `get_tuple()` returns `None` and the raw record is gone — Aerospike
 reclaimed it on its own. Invoking the thread again now starts a *fresh* session.
 
@@ -330,9 +340,15 @@ TTL did.
 
 ---
 
-## Run It
+## Run it
 
-Run from the repo root:
+From the repo root, install dependencies once:
+
+```bash
+uv sync
+```
+
+Then run the demo:
 
 ```bash
 # Quick validation: Steps 1–8 (create and resume a checkpoint), skip the wait.
@@ -342,7 +358,7 @@ uv run python cookbooks/auto-expiring-chat/demo.py --skip-wait
 uv run python cookbooks/auto-expiring-chat/demo.py
 ```
 
-## What To Expect
+## What to expect
 
 ```text
 ================================================================
