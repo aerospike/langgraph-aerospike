@@ -11,6 +11,15 @@ Aerospike-backed persistence for [LangGraph](https://github.com/langchain-ai/lan
 | [langgraph-checkpoint-aerospike](./packages/langgraph-checkpoint-aerospike) | Checkpoint saver for LangGraph graph execution state | `pip install -U langgraph-checkpoint-aerospike` |
 | [langgraph-store-aerospike](./packages/langgraph-store-aerospike)           | Key/value store with batch ops, search, and TTL      | `pip install -U langgraph-store-aerospike`      |
 
+## Cookbooks
+
+Runnable, production-shaped recipes live in [`cookbooks/`](./cookbooks):
+
+| Cookbook                                                              | What it shows                                                                       |
+| --------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| [auto-expiring-chat](./cookbooks/auto-expiring-chat)                  | Expire LangGraph chat checkpoints automatically with native Aerospike TTL           |
+| [fork-from-checkpoint](./cookbooks/fork-from-checkpoint)                | Fork from a past checkpoint and resume down a new path, reusing context the agent already derived |
+
 ## Requirements
 
 - Python >= 3.10
