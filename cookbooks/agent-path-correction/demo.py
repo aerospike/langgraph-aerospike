@@ -9,7 +9,7 @@ already-derived order id -- it is never looked up again. Then we use the saved
 refund checkpoint to write a handoff note explaining what changed and what to do
 now.
 
-    uv run python cookbooks/fork-from-checkpoint/demo.py
+    uv run python cookbooks/agent-path-correction/demo.py
 
 The walkthrough pauses for you to press Enter between phases.
 

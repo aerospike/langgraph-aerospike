@@ -1,21 +1,18 @@
 # Auto-Expiring Chat Sessions Using Aerospike TTL
 
-Keep LangGraph chat checkpoints for only as long as they are useful by letting
-Aerospike expire them natively.
-
-## The Problem
-
-Production chat agents write checkpoints constantly. If every thread lives
-forever, checkpoint storage grows without bound. A relational database usually
-needs a scheduled cleanup job:
+LangGraph writes a checkpoint after every agent step. Without expiration, those checkpoints accumulate indefinitely. Relational databases require a scheduled job to clean them up:
 
 ```sql
 DELETE FROM checkpoints WHERE updated_at < NOW() - INTERVAL '7 days';
 ```
 
-Aerospike does this at the record level. Each checkpoint record can carry a
-time to live (TTL), and Aerospike reclaims it automatically when it expires.
-No sweeper process, no cron job, and no cleanup query.
+That job needs to run reliably, not delete active sessions, and scale with your session volume. Aerospike solves this at the storage layer. Each checkpoint record carries a time to live (TTL), and Aerospike reclaims it automatically. No scheduled job, no cleanup query.
+
+## When to use this pattern
+
+- Users leave sessions open and never return. After the TTL elapses, Aerospike removes the records. Abandoned conversations do not accumulate.
+- Your product has a data retention requirement (compliance, internal policy) that mandates session data expires after a fixed period.
+- Active sessions should stay alive as long as the user is engaged. The `refresh_on_read` option extends a session's TTL each time a checkpoint is read, so active users keep their context while idle sessions expire.
 
 ## Prerequisites
 
@@ -33,18 +30,14 @@ deterministic output.
 
 ## How to use this cookbook
 
-This is a build-along tutorial. Each step explains what you are implementing and
-why, shows the code for that step, and then points to the exact place in the
-finished files (`agent.py` and `demo.py`) that implements it.
+Each step explains the code, shows it, and points to the matching location in the finished files. Open `agent.py` and `demo.py` side by side to follow along.
 
-You can either write the code yourself as you read, or open the two finished
-files side by side and follow along. The two files are the reference
-implementation; the steps are the recipe that produces them.
+Files:
 
-- `agent.py` — the LangGraph chat agent (Steps 1–3)
-- `demo.py` — connecting, configuring TTL, and proving expiry (Steps 4–9)
+- `agent.py`: the LangGraph chat agent (Steps 1–3)
+- `demo.py`: connecting, configuring TTL, and proving expiry (Steps 4–9)
 
-**File map for `agent.py`** (helps when following Steps 2–3):
+File map for `agent.py` (helps when following Steps 2–3):
 
 ```text
 agent.py
@@ -55,7 +48,7 @@ agent.py
     └── Step 3:  StateGraph wiring + compile              (tail of same function)
 ```
 
-**File map for `demo.py`** (helps when following Steps 4–9):
+File map for `demo.py` (helps when following Steps 4–9):
 
 ```text
 demo.py
@@ -352,10 +345,10 @@ Then run the demo:
 
 ```bash
 # Quick validation: Steps 1–8 (create and resume a checkpoint), skip the wait.
-uv run python cookbooks/auto-expiring-chat/demo.py --skip-wait
+uv run python cookbooks/expiring-chat-sessions/demo.py --skip-wait
 
 # Full lifecycle: includes Step 9's ~70 second wait for a 1-minute TTL to expire.
-uv run python cookbooks/auto-expiring-chat/demo.py
+uv run python cookbooks/expiring-chat-sessions/demo.py
 ```
 
 ## What to expect

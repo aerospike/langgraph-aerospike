@@ -4,21 +4,43 @@ Aerospike-backed persistence for [LangGraph](https://github.com/langchain-ai/lan
 
 ![Aerospike + LangGraph flow](./assets/Langgraph-Aerospike-Flow.png)
 
+## Why this exists
+
+[LangGraph](https://github.com/langchain-ai/langgraph) is an orchestration framework for stateful, multi-step AI agents. Every super-step produces a _checkpoint_, a snapshot of graph state. [Aerospike](https://aerospike.com/) is a real-time NoSQL database with sub-millisecond latency, native time to live (TTL) per record, and atomic map operations. Together they give LangGraph agents durable, expiry-aware, forkable state without a relational database.
+
+| Agent requirement | Aerospike primitive |
+|---|---|
+| Checkpoint durability | Record write with `COMMIT_LEVEL_ALL` |
+| Session expiry without a sweeper | Per-record TTL set at write time |
+| Resume from any past step | Checkpoint records keyed by `thread_id` + `checkpoint_id` |
+| Fork from a saved state | Direct key-value read, no replay or scan |
+| Long-term user memory across sessions | `AerospikeStore` with batch get/put |
+
+## Cookbooks
+
+Two production-shaped examples in [`cookbooks/`](./cookbooks):
+
+- [Expiring chat sessions](./cookbooks/expiring-chat-sessions): configure a TTL on the checkpointer so Aerospike reclaims abandoned sessions automatically. No cron job, no DELETE query. Demonstrates the full lifecycle: create, resume, expire, verify.
+- [Agent path correction](./cookbooks/agent-path-correction): rewind a thread to a past checkpoint and resume down a different path, reusing context the agent already derived. Demonstrates listing history, rehydrating state, and forking as direct low-latency key reads.
+
+Both demos use deterministic stubs instead of a live LLM. No API key is required. Swap in a real model by replacing the stub in `agent.py`. The graph shape and Aerospike behavior are unchanged.
+
+To run a working demo in under five minutes:
+
+```bash
+docker run -d --name aerospike -p 3000-3002:3000-3002 container.aerospike.com/aerospike/aerospike-server
+uv sync
+uv run python cookbooks/expiring-chat-sessions/demo.py --skip-wait
+```
+
+Aerospike Community Edition (the default Docker image above) is sufficient for all cookbooks.
+
 ## Packages
 
 | Package                                                                     | Description                                          | Install                                         |
 | --------------------------------------------------------------------------- | ---------------------------------------------------- | ----------------------------------------------- |
 | [langgraph-checkpoint-aerospike](./packages/langgraph-checkpoint-aerospike) | Checkpoint saver for LangGraph graph execution state | `pip install -U langgraph-checkpoint-aerospike` |
-| [langgraph-store-aerospike](./packages/langgraph-store-aerospike)           | Key/value store with batch ops, search, and TTL      | `pip install -U langgraph-store-aerospike`      |
-
-## Cookbooks
-
-Runnable, production-shaped recipes live in [`cookbooks/`](./cookbooks):
-
-| Cookbook                                                              | What it shows                                                                       |
-| --------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| [auto-expiring-chat](./cookbooks/auto-expiring-chat)                  | Expire LangGraph chat checkpoints automatically with native Aerospike TTL           |
-| [fork-from-checkpoint](./cookbooks/fork-from-checkpoint)                | Fork from a past checkpoint and resume down a new path, reusing context the agent already derived |
+| [langgraph-store-aerospike](./packages/langgraph-store-aerospike)           | key-value store with batch ops, search, and TTL      | `pip install -U langgraph-store-aerospike`      |
 
 ## Requirements
 
@@ -27,7 +49,7 @@ Runnable, production-shaped recipes live in [`cookbooks/`](./cookbooks):
 - `aerospike` Python client >= 15
 - `langgraph` >= 1.0
 
-## Quick Start
+## Quickstart
 
 ### 1. Start Aerospike
 
@@ -67,6 +89,8 @@ store.put(namespace=("users", "profiles"), key="user_123", value={"name": "Alice
 item = store.get(namespace=("users", "profiles"), key="user_123")
 ```
 
+For complete, runnable examples that demonstrate these APIs end to end, see the [cookbooks](#cookbooks).
+
 ## Configuration
 
 Both packages read connection details from environment variables by default:
@@ -80,48 +104,21 @@ Both packages read connection details from environment variables by default:
 
 ## Development
 
-Each package in this monorepo is independently installable and testable. The workflow below is per-package — install both if you want to develop them together.
-
-### Prerequisites
-
-- Python >= 3.10
-- A running Aerospike server (see [Quick Start](#1-start-aerospike))
-
-### 1. Clone and create a virtualenv
+Each package is independently installable and testable. Install whichever you're modifying:
 
 ```bash
-git clone https://github.com/aerospike/aerospike-langgraph.git
-cd aerospike-langgraph
-
-python -m venv venv
-source venv/bin/activate           # Linux / macOS
-# .\venv\Scripts\Activate.ps1      # Windows PowerShell
-
-python -m pip install --upgrade pip
-```
-
-### 2. Install the package(s) you want to work on
-
-Each package declares a `[dev]` extra that pulls in everything needed to run its tests. Install whichever you're modifying:
-
-```bash
-# Checkpoint saver
 pip install -e "packages/langgraph-checkpoint-aerospike[dev]"
-
-# Store
 pip install -e "packages/langgraph-store-aerospike[dev]"
 ```
 
-The `-e` (editable) flag means your source changes are picked up immediately without reinstalling. You can install both at once if you want:
+Run the tests:
 
 ```bash
-pip install -e "packages/langgraph-checkpoint-aerospike[dev]" \
-            -e "packages/langgraph-store-aerospike[dev]"
+pytest packages/langgraph-checkpoint-aerospike/tests
+pytest packages/langgraph-store-aerospike/tests
 ```
 
-### 3. Run the tests
-
-Tests are integration tests that connect to a real Aerospike cluster. Defaults are `127.0.0.1:3000`, namespace `test` — override via environment variables if needed:
+Tests connect to a real Aerospike cluster. Defaults are `127.0.0.1:3000`, namespace `test`. Override with environment variables if needed:
 
 | Variable              | Default     |
 | --------------------- | ----------- |
@@ -129,27 +126,13 @@ Tests are integration tests that connect to a real Aerospike cluster. Defaults a
 | `AEROSPIKE_PORT`      | `3000`      |
 | `AEROSPIKE_NAMESPACE` | `test`      |
 
-```bash
-pytest packages/langgraph-checkpoint-aerospike/tests
-pytest packages/langgraph-store-aerospike/tests
-```
-
-### Alternative: using `uv`
-
-If you have [uv](https://docs.astral.sh/uv/) installed, the whole setup collapses to a single command. The repo is configured as a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/), so `uv sync` creates a `.venv`, installs both packages in editable mode, and pulls in all dev dependencies.
+If you have [uv](https://docs.astral.sh/uv/) installed, `uv sync` from the repo root replaces all of the above. The repo is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/), so it installs both packages in editable mode and pulls in dev dependencies.
 
 ```bash
-# One-time: install uv (see https://docs.astral.sh/uv/getting-started/installation/)
-
-# Install everything
 uv sync
-
-# Run tests
 uv run pytest packages/langgraph-checkpoint-aerospike/tests
 uv run pytest packages/langgraph-store-aerospike/tests
 ```
-
-uv is optional — the pip-based workflow above remains fully supported. Adopt whichever you prefer.
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for linting, commit conventions, and CI details.
 

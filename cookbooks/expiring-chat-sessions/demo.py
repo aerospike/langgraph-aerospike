@@ -4,8 +4,8 @@ Run this against a local Aerospike to watch a LangGraph chat session save its
 state, resume from that state, and then *vanish on its own* once the Aerospike
 TTL elapses -- no cron job, no cleanup query.
 
-    uv run python cookbooks/auto-expiring-chat/demo.py
-    uv run python cookbooks/auto-expiring-chat/demo.py --skip-wait   # phases 1-3 only
+    uv run python cookbooks/expiring-chat-sessions/demo.py
+    uv run python cookbooks/expiring-chat-sessions/demo.py --skip-wait   # phases 1-3 only
 
 Phases:
     1. Connect and configure TTL on the checkpointer.

@@ -1,73 +1,33 @@
 # Fork from a Checkpoint with Aerospike
 
-Rewind a LangGraph thread to a past checkpoint and resume it down a new path,
-reusing the context the agent already built up, while the saved history can
-still explain how the outcome changed.
+When an agent derives context along the way (an order lookup, a document parse, an API call), that work is expensive to repeat. If the conversation needs to take a different path, you want to resume from a saved moment with the corrected input, not start over from scratch.
 
-## What this cookbook is
+LangGraph writes a checkpoint after every step. Aerospike stores each one as a key-value record keyed by `thread_id` and `checkpoint_id`, so listing history, rehydrating a past state, and resuming from it are direct, low-latency reads with no replay or scan.
 
-A build-along tutorial in the [Aerospike LangGraph](../../README.md) repo.
-You implement a small support-ticket agent, persist its execution history to
-Aerospike using LangGraph's checkpoint saver, then fork that history: rewind
-to an earlier saved moment and continue down a different path.
+## The scenario
 
-**The scenario.** A customer opens a ticket about broken headphones and asks for
-a refund. The agent reads the message, looks up the matching order id,
-classifies intent, and selects a refund. The customer then replies: "actually,
-send a replacement instead." You do not rerun the whole conversation from
-scratch — you rewind to the checkpoint from *after* the order was identified and
-resume from there with the corrected request. The fork reuses the saved
-`order_id`; the original refund checkpoint gives the demo enough saved context
-to write a concise handoff note explaining what changed and what to do now.
+A customer reports broken headphones and asks for a refund. The agent identifies the order, classifies the intent, and selects a refund. The customer then says: "actually, send a replacement instead."
 
-**What you run.** `agent.py` defines the graph; `demo.py` walks through five
-phases (original refund request → the customer changes their mind → find the
-reuse point in saved history → fork → use the old checkpoint to explain the
-correction in a handoff note).
+The corrected message no longer mentions the product. A fresh run would not know which order to use. Instead, you rewind to the checkpoint where the order was already identified and resume from there with the correction applied. The fork reuses the saved `order_id`. The original refund checkpoint stays in Aerospike and provides the before-state for a handoff note.
 
-**Who does what.** Three pieces with distinct jobs:
+## When to use this pattern
 
-- **LangGraph** — orchestration: the nodes, the routing between them, and the
-  checkpoint it writes after every step. LangGraph is a state machine with
-  durable state; LLMs are its most common kind of node, not a requirement.
-- **Aerospike** — durable state: it stores each checkpoint as a record keyed by
-  `thread_id`, `checkpoint_ns`, and `checkpoint_id`, so listing history,
-  rehydrating, and forking are direct, low-latency key-value reads (no scan, no replay).
-- **The intelligence layer** — normally an LLM node. Here it is stubbed with
-  deterministic helpers (`_lookup_order`, `_classify_intent`) so the fork reroutes
-  identically every run — which is what lets the demo prove the corrected
-  request changed the outcome. Swap in a real model without touching the graph
-  shape or the Aerospike behavior.
-
-## The Problem
-
-Resolving a ticket depends on **derived state** — context the agent builds up
-along the way. The order lookup is the expensive, conversation-derived piece:
-you do not want to recompute it because the customer corrected themselves.
-
-So instead of restarting and re-deriving the order id, you **rewind to the moment
-it was identified and take a different action from there.** That is what LangGraph
-checkpoints + Aerospike provide: every super-step writes a checkpoint you can
-list, rehydrate, and fork — resuming from saved state down a new path.
+- A user corrects themselves after the agent has already done expensive setup work. Forking reuses the derived context without repeating it.
+- A human reviewer overrides an agent decision. Fork from before the decision point and resume with the correction applied.
+- You want to explore two resolution paths from the same intermediate state without re-running the full pipeline.
 
 ## How to use this cookbook
 
-Each step explains what you are implementing and why, shows the code, and
-points to where it lives in the finished files. Write it yourself as you go, or
-read along with the two files open.
+Each step explains the code, shows it, and points to the matching location in the finished files. Open `agent.py` and `demo.py` side by side to follow along.
 
-- `agent.py` — the LangGraph support agent (Steps 1–5)
-- `demo.py` — connecting, running, listing history, rehydrating, and forking (Steps 6–12)
+Files:
 
-Most of `agent.py` lives inside one factory function,
-**`build_support_graph(checkpointer)`**: it takes the Aerospike-backed
-checkpointer, defines the graph's nodes as inner functions, wires them together,
-and returns a compiled graph. Steps 2–5 build this function up piece by piece and
-compile it at the end; the module-level helpers (`_lookup_order`,
-`_classify_intent`) sit outside it. Keep that shape in mind — the steps in this
-document refer to it as they go.
+- `agent.py`: the LangGraph support agent (Steps 1–5)
+- `demo.py`: connecting, running, listing history, rehydrating, and forking (Steps 6–12)
 
-**File map for `agent.py`** (Steps 1–5):
+Most of `agent.py` lives inside one factory function, `build_support_graph(checkpointer)`: it defines the graph's nodes as inner functions, wires them together, and returns a compiled graph. The module-level helpers (`_lookup_order`, `_classify_intent`) sit outside it.
+
+File map for `agent.py` (Steps 1–5):
 
 ```text
 agent.py
@@ -79,7 +39,7 @@ agent.py
     └── Step 5:  route(state) + StateGraph wiring + compile (tail)
 ```
 
-**File map for `demo.py`** (Steps 6–12):
+File map for `demo.py` (Steps 6–12):
 
 ```text
 demo.py
@@ -94,8 +54,7 @@ demo.py
     └── Step 12:  write a handoff note from saved state (Phase 5)
 ```
 
-This cookbook assumes you already have an Aerospike server running and reachable
-(see the [repo README](../../README.md) for a one-line Docker command).
+This cookbook assumes you have an Aerospike server running on port 3000. See the [repo README](../../README.md) for a one-line Docker command.
 
 ## Prerequisites
 
@@ -481,7 +440,7 @@ uv sync
 Then run the demo:
 
 ```bash
-uv run python cookbooks/fork-from-checkpoint/demo.py
+uv run python cookbooks/agent-path-correction/demo.py
 ```
 
 The walkthrough **pauses between phases** — press Enter to advance through each
