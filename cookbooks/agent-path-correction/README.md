@@ -1,74 +1,33 @@
 # Fork from a Checkpoint with Aerospike
 
-Rewind a LangGraph thread to a past checkpoint and resume it down a new path —
-**reusing the context the agent already built up** — while the saved history can
-still explain how the outcome changed.
+When an agent derives context along the way (an order lookup, a document parse, an API call), that work is expensive to repeat. If the conversation needs to take a different path, you want to resume from a saved moment with the corrected input, not start over from scratch.
 
-## What this cookbook is
+LangGraph writes a checkpoint after every step. Aerospike stores each one as a key-value record keyed by `thread_id` and `checkpoint_id`, so listing history, rehydrating a past state, and resuming from it are direct, low-latency reads with no replay or scan.
 
-A **build-along tutorial** in the [Aerospike LangGraph](../../README.md) repo.
-You implement a small support-ticket agent, persist its execution history to
-Aerospike via LangGraph's checkpoint saver, then **fork** that history: rewind
-to an earlier saved moment and continue down a different path.
+## The scenario
 
-**The scenario.** A customer opens a ticket about broken headphones and asks for
-a **refund**. The agent reads the message, looks up the matching **order id**,
-classifies intent, and selects a refund. The customer then replies: "actually,
-send a **replacement** instead." You don't rerun the whole conversation from
-scratch — you rewind to the checkpoint from *after* the order was identified and
-resume from there with the corrected request. The fork reuses the saved
-`order_id`; the original refund checkpoint gives the demo enough saved context
-to write a concise handoff note explaining what changed and what to do now.
+A customer reports broken headphones and asks for a refund. The agent identifies the order, classifies the intent, and selects a refund. The customer then says: "actually, send a replacement instead."
 
-**What you'll run.** `agent.py` defines the graph; `demo.py` walks through five
-phases (original refund request → the customer changes their mind → find the
-reuse point in saved history → fork → use the old checkpoint to explain the
-correction in a handoff note).
+The corrected message no longer mentions the product. A fresh run would not know which order to use. Instead, you rewind to the checkpoint where the order was already identified and resume from there with the correction applied. The fork reuses the saved `order_id`. The original refund checkpoint stays in Aerospike and provides the before-state for a handoff note.
 
-**Who does what.** Three pieces with distinct jobs — keeping them separate is the
-whole idea:
+## When to use this pattern
 
-- **LangGraph** — orchestration: the nodes, the routing between them, and the
-  checkpoint it writes after every step. LangGraph is a state machine with
-  durable state; LLMs are just its most common kind of node, not a requirement.
-- **Aerospike** — durable state: it stores each checkpoint as a record keyed by
-  `thread_id`, `checkpoint_ns`, and `checkpoint_id`, so listing history,
-  rehydrating, and forking are direct, sub-millisecond reads (no scan, no replay).
-- **The "intelligence"** — normally an LLM node. Here it's stubbed with
-  deterministic helpers (`_lookup_order`, `_classify_intent`) so the fork reroutes
-  identically every run — which is what lets the demo *prove* the corrected
-  request changed the outcome. Swap in a real model without touching the graph
-  shape or the Aerospike behavior.
+- A user corrects themselves after the agent has already done expensive setup work. Forking reuses the derived context without repeating it.
+- A human reviewer overrides an agent decision. Fork from before the decision point and resume with the correction applied.
+- You want to explore two resolution paths from the same intermediate state without re-running the full pipeline.
 
-## The Problem
+## How to use this cookbook
 
-Resolving a ticket depends on **derived state** — context the agent builds up
-along the way. The order lookup is the expensive, conversation-derived piece:
-you don't want to recompute it just because the customer corrected themselves.
+Each step explains the code, shows it, and points to the matching location in the finished files. Open `agent.py` and `demo.py` side by side to follow along.
 
-So instead of restarting and re-deriving the order id, you **rewind to the moment
-it was identified and take a different action from there.** That is what LangGraph
-checkpoints + Aerospike provide: every super-step writes a checkpoint you can
-list, rehydrate, and fork — resuming from saved state down a new path.
+Files:
 
-## How To Use This Cookbook
+- `agent.py`: the LangGraph support agent (Steps 1–5)
+- `demo.py`: connecting, running, listing history, rehydrating, and forking (Steps 6–12)
 
-Each step explains **what** you're implementing and **why**, shows the code, and
-points to where it lives in the finished files. Write it yourself as you go, or
-read along with the two files open.
+Most of `agent.py` lives inside one factory function, `build_support_graph(checkpointer)`: it defines the graph's nodes as inner functions, wires them together, and returns a compiled graph. The module-level helpers (`_lookup_order`, `_classify_intent`) sit outside it.
 
-- `agent.py` — the LangGraph support agent (Steps 1–5)
-- `demo.py` — connecting, running, listing history, rehydrating, and forking (Steps 6–12)
-
-Most of `agent.py` lives inside one factory function,
-**`build_support_graph(checkpointer)`**: it takes the Aerospike-backed
-checkpointer, defines the graph's nodes as inner functions, wires them together,
-and returns a compiled graph. Steps 2–5 build this function up piece by piece and
-compile it at the end; the module-level helpers (`_lookup_order`,
-`_classify_intent`) sit outside it. Keep that shape in mind — the steps below
-refer to it as they go.
-
-**File map for `agent.py`** (Steps 1–5):
+File map for `agent.py` (Steps 1–5):
 
 ```text
 agent.py
@@ -80,7 +39,7 @@ agent.py
     └── Step 5:  route(state) + StateGraph wiring + compile (tail)
 ```
 
-**File map for `demo.py`** (Steps 6–12):
+File map for `demo.py` (Steps 6–12):
 
 ```text
 demo.py
@@ -95,8 +54,21 @@ demo.py
     └── Step 12:  write a handoff note from saved state (Phase 5)
 ```
 
-This cookbook assumes you already have an Aerospike server running and reachable
-(see the [repo README](../../README.md) for a one-line Docker command).
+This cookbook assumes you have an Aerospike server running on port 3000. See the [repo README](../../README.md) for a one-line Docker command.
+
+## Prerequisites
+
+Before you start, confirm you have:
+
+| Component | Requirement |
+|-----------|-------------|
+| Python | 3.10 or newer |
+| [uv](https://docs.astral.sh/uv/) | Installed (repo uses `uv run` for cookbook scripts) |
+| Aerospike Database | Running and reachable on port 3000 (local or remote) |
+| This repo | Cloned; dependencies installed with `uv sync` from the repo root |
+
+No LLM API keys are required. The agent uses deterministic helpers instead of a
+live model.
 
 ---
 
@@ -104,8 +76,8 @@ This cookbook assumes you already have an Aerospike server running and reachable
 
 **What this step does:** The graph operates on a shared state holding the
 conversation plus the context the agent derives. `order_id` is the field this
-whole cookbook revolves around: it's derived early and must survive a rewind.
-We use the `add_messages` reducer so resuming with a new user turn *appends* to
+whole cookbook revolves around: it is derived early and must survive a rewind.
+Use the `add_messages` reducer so resuming with a new user turn *appends* to
 history.
 
 ```python
@@ -130,7 +102,7 @@ class SupportState(TypedDict):
 ## Step 2 — Look up the order (the context-deriving step)
 
 **What this step does:** The first node reads what the customer described and
-turns it into an `order_id` via a catalog lookup (a stand-in for an orders API).
+turns it into an `order_id` with a catalog lookup (a stand-in for an orders API).
 It also treats `order_id` as durable state: if the id is already present, the
 node leaves it alone instead of doing the lookup again.
 
@@ -164,13 +136,13 @@ def identify_order(state: SupportState) -> SupportState:
 
 **In the code:** `agent.py`, `# === Step 2 ===`. That `if state.get("order_id")`
 guard makes the node idempotent: if this node ever runs on state that already
-has an order id, it does not repeat the lookup. In Step 11 we fork from *after*
+has an order id, it does not repeat the lookup. In Step 11 you fork from *after*
 this node, so the saved `ORD-10482` is already in the checkpoint and carries
 forward into the new path.
 
-> Swapping in real systems is localized: replace `_lookup_order` with your
-> orders API and the body of `_classify_intent` (Step 3) with an LLM. The graph
-> shape and Aerospike behavior are identical.
+> **Tip:** To use real systems, replace `_lookup_order` with your orders API and
+> the body of `_classify_intent` (Step 3) with an LLM. The graph shape and
+> Aerospike behavior stay the same.
 
 ---
 
@@ -239,7 +211,7 @@ def escalate(state: SupportState) -> SupportState:
 
 **What this step does:** Run `identify_order` first, then `classify`, then a
 conditional edge that routes to one of the resolution nodes on `intent`. The
-`identify_order → classify` order is what creates the checkpoint we want to
+`identify_order → classify` order is what creates the checkpoint you want to
 rewind to: order id known, decision not yet made.
 
 ```python
@@ -294,9 +266,8 @@ environment.
 
 ## Step 7 — Build the checkpointer
 
-**What this step does:** Create an `AerospikeSaver`. We pass **no TTL** — the
-whole point is that the checkpoint history *persists* so we can travel back
-through it.
+**What this step does:** Create an `AerospikeSaver`. The checkpointer uses no
+TTL — the checkpoint history must persist so you can travel back through it.
 
 ```python
 def _build_checkpointer(client: aerospike.Client) -> AerospikeSaver:
@@ -325,11 +296,11 @@ In `main()`, this is Phase 1 — the original request, *"I bought a pair of Aero
 headphones that arrived broken. I'd like a refund."* The demo first prints the
 blank starting state (`order_id=None`, `intent=None`, `resolution=None`) so it's
 clear the agent derives everything from scratch, then resolves to a refund for
-`ORD-10482`. We stash the final checkpoint's config so Step 12 can compare the
+`ORD-10482`. The demo stashes the final checkpoint's config so Step 12 can compare the
 original run with the corrected run.
 
 Phase 2 has no new code — it captures the customer's correction (*"send a
-replacement instead"*) before we touch the history. Because that correction no
+replacement instead"*) before you touch the history. Because that correction no
 longer mentions "headphones," Phase 3 has a concrete job: find a saved state that
 already knows the order id.
 
@@ -396,7 +367,7 @@ order lookup node does not run again.
 
 ## Step 11 — Fork from it, reusing the saved order id
 
-**What this step does:** This is the payoff. `fork_point.config` carries the
+**What this step does:** Resume from the fork point. `fork_point.config` carries the
 historical `checkpoint_id`, so invoking the graph with it resumes from that saved
 state. Because the fork point is *after* `identify_order`, the saved `order_id`
 is already present and the resumed path continues at `classify`. The corrected
@@ -419,11 +390,11 @@ forked = _resolve(graph, fork_config, CORRECTED_REQUEST)   # "...send a replacem
 ## Step 12 — Use history to write the handoff note
 
 **What this step does:** Forking resumes from an earlier checkpoint, so the refund
-checkpoints were never touched. We read the original decision back out of Aerospike
+checkpoints were never touched. Read the original decision back out of Aerospike
 by its checkpoint id and use it with the corrected run to write a short internal
 handoff note. That gives the kept history a concrete purpose: the note says what
 the customer first asked for, what changed, which order id was reused, and which
-outcome should be used now.
+outcome to use now.
 
 ```python
 original_after = saver.get_tuple(original_final_config).checkpoint["channel_values"]
@@ -443,13 +414,13 @@ print(f'  corrected request: "{CORRECTED_REQUEST}"')
 
 The demo prints a compact handoff note from saved state:
 
-- **original request** — broken headphones, refund requested
-- **original decision** — `Refund selected for order ORD-10482`
-- **corrected request** — replacement requested
-- **current outcome** — `Replacement selected for order ORD-10482`
-- **reused context** — the same `ORD-10482`
+- original request — broken headphones, refund requested
+- original decision — `Refund selected for order ORD-10482`
+- corrected request — replacement requested
+- current outcome — `Replacement selected for order ORD-10482`
+- reused context — the same `ORD-10482`
 
-Both `resolution` strings are just graph state — this demo never calls payment or
+Both `resolution` strings are graph state — this demo never calls payment or
 fulfillment systems.
 
 **In the code:** `demo.py`, `# === Step 12 ===` (Phase 5). The demo returns a
@@ -458,18 +429,24 @@ the order id wasn't reused.
 
 ---
 
-## Run It
+## Run it
 
-Run from the repo root:
+From the repo root, install dependencies once:
 
 ```bash
-uv run python cookbooks/fork-from-checkpoint/demo.py
+uv sync
+```
+
+Then run the demo:
+
+```bash
+uv run python cookbooks/agent-path-correction/demo.py
 ```
 
 The walkthrough **pauses between phases** — press Enter to advance through each
 one so you can follow along.
 
-## What To Expect
+## What to expect
 
 You'll be prompted (`... press Enter for the next step ...`) between each phase.
 Shown here without the prompts:
@@ -491,7 +468,7 @@ Phase 2 - The customer changes their mind
 ================================================================
   customer    > On second thought, please send a replacement instead.
   This request does not mention headphones, so a fresh run would not know
-  which order to use. We need a saved checkpoint that already has order_id.
+  which order to use. You need a saved checkpoint that already has order_id.
 
 ================================================================
 Phase 3 - Find the reuse point in Aerospike

@@ -9,7 +9,7 @@ already-derived order id -- it is never looked up again. Then we use the saved
 refund checkpoint to write a handoff note explaining what changed and what to do
 now.
 
-    uv run python cookbooks/fork-from-checkpoint/demo.py
+    uv run python cookbooks/agent-path-correction/demo.py
 
 The walkthrough pauses for you to press Enter between phases.
 
@@ -179,7 +179,7 @@ def main() -> int:
         _hr("Phase 2 - The customer changes their mind")
         print(f"  customer    > {CORRECTED_REQUEST}")
         print("  This request does not mention headphones, so a fresh run would not know")
-        print("  which order to use. We need a saved checkpoint that already has order_id.")
+        print("  which order to use. You need a saved checkpoint that already has order_id.")
 
         # === Step 9 / Phase 3: read history + rehydrate the order-id checkpoint ===
         # Now that we know what we want, look at what Aerospike saved and find
