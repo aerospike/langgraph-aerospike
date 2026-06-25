@@ -99,3 +99,39 @@ def test_ttl_resets_on_read(short_ttl_saver, client, aerospike_namespace):
     # ttl_after would be roughly ttl_before - 1 or less.
     # Allowing equality handles coarse timer resolution.
     assert ttl_after >= ttl_before, f"Expected ttl_after ({ttl_after}) >= ttl_before ({ttl_before})"
+
+
+def test_timeline_refreshes_on_get(short_ttl_saver, client):
+    """Verify that calling get_tuple refreshes the timeline record's TTL."""
+    cfg = {
+        "configurable": {
+            "thread_id": "timeline-refresh-demo",
+            "checkpoint_ns": "demo-ns",
+        }
+    }
+    checkpoint = {"id": "ck-timeline-1", "foo": "bar"}
+    metadata = {}
+
+    saved_config = short_ttl_saver.put(cfg, checkpoint, metadata, {})
+
+    timeline_key = short_ttl_saver._key_timeline(
+        cfg["configurable"]["thread_id"],
+        cfg["configurable"]["checkpoint_ns"]
+    )
+
+    # Wait to let TTL decrease
+    time.sleep(10)
+
+    _, meta_before, _ = client.get(timeline_key)
+    ttl_before = meta_before["ttl"]
+
+    # Call get_tuple to trigger refresh
+    short_ttl_saver.get_tuple(saved_config)
+
+    # Wait a bit to let policy touch and register
+    time.sleep(1)
+
+    _, meta_after, _ = client.get(timeline_key)
+    ttl_after = meta_after["ttl"]
+
+    assert ttl_after >= ttl_before, f"Expected timeline TTL to be refreshed, got {ttl_after} (was {ttl_before})"
