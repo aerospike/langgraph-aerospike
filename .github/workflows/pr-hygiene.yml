@@ -1,4 +1,4 @@
-name: PR Hygiene - Jira Ticket in Title
+name: PR Hygiene - PR Title
 
 on:
   pull_request:
@@ -8,8 +8,9 @@ permissions:
   contents: read
 
 jobs:
-  validate-jira-ticket:
+  validate-pr-title:
     uses: aerospike/shared-workflows/.github/workflows/reusable_pr-hygiene.yml@bd168dedaa4fc0b17a560541779d815540eded2d # v3.7.0
     with:
       pr_title: ${{ github.event.pull_request.title }}
       pr-labels: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+      types-requiring-jira: ""

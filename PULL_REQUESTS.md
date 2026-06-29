@@ -4,24 +4,23 @@ This repo enforces PR title format in CI and provides a body template on GitHub.
 
 ## PR title (required — CI enforced)
 
-Every PR title is validated by the [PR Hygiene workflow](.github/workflows/pr-hygiene.yml) using [Conventional Commits](https://www.conventionalcommits.org/) and, for some types, a Jira ticket.
+Every PR title is validated by the [PR Hygiene workflow](.github/workflows/pr-hygiene.yml) using [Conventional Commits](https://www.conventionalcommits.org/). Jira tickets are not required.
 
 ### Format
 
 ```text
-type(scope): [JIRA-123] short description
+type(scope): short description
 ```
 
 | Part | Required | Rules |
 |------|----------|-------|
 | `type` | Yes | Lowercase conventional commit type (see table below) |
 | `(scope)` | No | Lowercase; letters, digits, `-`, `_` (e.g. `cookbooks`, `checkpoint`, `ci`) |
-| `[JIRA-123]` | Sometimes | Uppercase project key + hyphen + number; required for `feat` and `fix` |
 | `description` | Yes | Imperative, concise summary (no trailing period) |
 
 ### Valid `type` values
 
-These are validated by `@commitlint/config-conventional`:
+The PR title check accepts these conventional commit types:
 
 | Type | When to use |
 |------|-------------|
@@ -36,18 +35,11 @@ These are validated by `@commitlint/config-conventional`:
 | `chore` | Maintenance (deps, tooling) that doesn't fit other types |
 | `revert` | Reverts a previous commit |
 
-### Jira ticket rules
-
-- **Required** when `type` is `feat` or `fix`
-- **Optional** for all other types (`docs`, `chore`, `ci`, etc.)
-- Ticket must appear immediately after the colon, in square brackets, before the description
-- Pattern: `[A-Z]{2,10}-[0-9]+` (e.g. `[LANG-42]`, `[INFRA-370]`)
-
 ### Title examples
 
 ```text
 docs(cookbooks): add fork-from-checkpoint cookbook
-fix(checkpoint): [LANG-99] handle missing parent checkpoint on fork
+fix(checkpoint): handle missing parent checkpoint on fork
 docs: document PR title conventions
 chore(deps): refresh uv.lock via weekly upgrade
 ci: run deptry on both packages
@@ -59,11 +51,9 @@ Invalid examples:
 
 ```text
 Add fork cookbook                          # not conventional commit format
-feat: add fork cookbook                    # feat requires [JIRA-123]
-feat(cookbooks): add fork cookbook         # feat requires [JIRA-123]
-Feat(cookbooks): [LANG-42] add fork        # type must be lowercase
-feat(Cookbooks): [LANG-42] add fork       # scope must be lowercase
-feat(cookbooks): LANG-42 add fork         # ticket must be in [brackets]
+Feat(cookbooks): add fork                  # type must be lowercase
+feat(Cookbooks): add fork                  # scope must be lowercase
+feature(cookbooks): add fork               # type must be a valid conventional commit type
 ```
 
 ## PR body
