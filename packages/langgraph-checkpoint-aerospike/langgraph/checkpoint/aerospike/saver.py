@@ -330,6 +330,10 @@ class AerospikeSaver(BaseCheckpointSaver):
         if got is None:
             return None
 
+        # Refresh timeline record TTL if refresh_on_read is configured
+        if self._refresh_on_read and self._ttl_minutes is not None and self._ttl_minutes > 0:
+            self._get(self._key_timeline(thread_id, checkpoint_ns))
+
         _, _, bins = got
 
         cp_type = bins.get("cp_type")
