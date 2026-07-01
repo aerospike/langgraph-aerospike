@@ -51,7 +51,7 @@ wheels = [
 
 [[package]]
 name = "aerospike-langgraph"
-version = "0.2.1"
+version = "0.3.0"
 source = { virtual = "." }
 dependencies = [
     { name = "langgraph-checkpoint-aerospike" },
@@ -943,7 +943,7 @@ wheels = [
 
 [[package]]
 name = "langgraph-checkpoint-aerospike"
-version = "0.2.1"
+version = "0.3.0"
 source = { editable = "packages/langgraph-checkpoint-aerospike" }
 dependencies = [
     { name = "aerospike" },
@@ -1008,7 +1008,7 @@ wheels = [
 
 [[package]]
 name = "langgraph-store-aerospike"
-version = "0.2.1"
+version = "0.3.0"
 source = { editable = "packages/langgraph-store-aerospike" }
 dependencies = [
     { name = "aerospike" },
