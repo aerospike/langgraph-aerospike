@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   validate-pr-title:
-    uses: aerospike/shared-workflows/.github/workflows/reusable_pr-hygiene.yml@a9e883e43e0d4679ff1a250ea1ef577332a81722 # v3.8.0
+    uses: aerospike/shared-workflows/.github/workflows/reusable_pr-hygiene.yml@d70905d2259d746d19783ecfc0ea5f337c1d5176 # v3.8.1
     with:
       pr_title: ${{ github.event.pull_request.title }}
       pr-labels: ${{ toJSON(github.event.pull_request.labels.*.name) }}
