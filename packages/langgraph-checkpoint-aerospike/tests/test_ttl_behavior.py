@@ -101,82 +101,114 @@ def test_ttl_resets_on_read(short_ttl_saver, client, aerospike_namespace):
     assert ttl_after >= ttl_before, f"Expected ttl_after ({ttl_after}) >= ttl_before ({ttl_before})"
 
 
-def test_timeline_refreshes_on_get(short_ttl_saver, client):
-    """Verify that calling get_tuple refreshes the timeline record's TTL."""
+def test_latest_refreshes_on_get(short_ttl_saver, client):
+    """Read-by-id should refresh the ``__latest__`` record's TTL.
+
+    That path reads the checkpoint directly, so the latest pointer needs an
+    explicit touch to keep future "latest" lookups valid.
+    """
     cfg = {
         "configurable": {
-            "thread_id": "timeline-refresh-demo",
+            "thread_id": "latest-refresh-demo",
             "checkpoint_ns": "demo-ns",
         }
     }
-    checkpoint = {"id": "ck-timeline-1", "foo": "bar"}
+    checkpoint = {"id": "ck-latest-1", "foo": "bar"}
     metadata = {}
 
     saved_config = short_ttl_saver.put(cfg, checkpoint, metadata, {})
+    assert saved_config["configurable"].get("checkpoint_id")
 
-    timeline_key = short_ttl_saver._key_timeline(
+    latest_key = short_ttl_saver._key_latest(
         cfg["configurable"]["thread_id"], cfg["configurable"]["checkpoint_ns"]
     )
 
     # Wait to let TTL decrease
     time.sleep(10)
 
-    _, meta_before, _ = client.get(timeline_key)
+    _, meta_before, _ = client.get(latest_key)
     ttl_before = meta_before["ttl"]
 
-    # Call get_tuple to trigger refresh
+    # Call get_tuple by id to trigger the index refresh
     short_ttl_saver.get_tuple(saved_config)
 
-    # Wait a bit to let policy touch and register
+    # Wait a bit to let the touch register
     time.sleep(1)
 
-    _, meta_after, _ = client.get(timeline_key)
+    _, meta_after, _ = client.get(latest_key)
     ttl_after = meta_after["ttl"]
 
     assert ttl_after >= ttl_before, (
-        f"Expected timeline TTL to be refreshed, got {ttl_after} (was {ttl_before})"
+        f"Expected latest TTL to be refreshed, got {ttl_after} (was {ttl_before})"
     )
 
 
-def test_timeline_refreshes_on_get_mocked():
-    """Verify via mocking that get_tuple refreshes the timeline record's TTL when refresh_on_read is True."""
+def _mock_saver(ttl):
+    """Build an AerospikeSaver backed by a MagicMock client (no live cluster)."""
     from unittest.mock import MagicMock
 
     from langgraph.checkpoint.aerospike import AerospikeSaver
 
-    # Create mock client
     mock_client = MagicMock()
-
-    # Aerospike client.get returns a tuple: (key, meta, bins)
-    # where bins contains the checkpoint data
     checkpoint_bins = {
         "cp_type": "json",
         "checkpoint": b'{"id": "ck-1", "ts": "2026-06-26T00:00:00Z"}',
         "meta_type": "json",
         "metadata": b"{}",
     }
-    mock_client.get.side_effect = lambda key, policy=None: (key, {"ttl": 60}, checkpoint_bins)
+    latest_bins = {"thread_id": "thread-1", "checkpoint_id": "ck-1", "ts": "2026-06-26T00:00:00Z"}
 
-    saver = AerospikeSaver(
-        client=mock_client, namespace="test", ttl={"default_ttl": 60, "refresh_on_read": True}
-    )
+    def _fake_get(key, policy=None):
+        if isinstance(key, tuple) and isinstance(key[2], str) and key[2].endswith("__latest__"):
+            return (key, {"ttl": 60}, latest_bins)
+        return (key, {"ttl": 60}, checkpoint_bins)
 
-    # Call get_tuple
+    mock_client.get.side_effect = _fake_get
+
+    saver = AerospikeSaver(client=mock_client, namespace="test", ttl=ttl)
+    return saver, mock_client
+
+
+def test_get_tuple_by_id_touches_latest_mocked():
+    """Read-by-id refreshes ``__latest__`` with a lightweight touch."""
+    saver, mock_client = _mock_saver({"default_ttl": 60, "refresh_on_read": True})
+
     config = {
         "configurable": {"thread_id": "thread-1", "checkpoint_ns": "ns-1", "checkpoint_id": "ck-1"}
     }
-
     saver.get_tuple(config)
 
-    # Verify that client.get was called for the timeline key with the read_touch policy
-    timeline_key = saver._key_timeline("thread-1", "ns-1")
+    latest_key = saver._key_latest("thread-1", "ns-1")
+    mock_client.touch.assert_called_once_with(latest_key, 60 * 60)
 
-    # Let's inspect all calls to client.get
-    get_calls = mock_client.get.call_args_list
 
-    # We expect get_calls to contain the timeline key read
-    timeline_call = next((call for call in get_calls if call[0][0] == timeline_key), None)
+def test_get_tuple_by_latest_does_not_double_touch_mocked():
+    """Resolving via ``__latest__`` reads it, so no extra touch is issued."""
+    saver, mock_client = _mock_saver({"default_ttl": 60, "refresh_on_read": True})
 
-    assert timeline_call is not None, "Expected client.get to be called on timeline record key"
-    # The policy should have read_touch_ttl_percent = 100
-    assert timeline_call[1].get("policy") == {"read_touch_ttl_percent": 100}
+    config = {"configurable": {"thread_id": "thread-1", "checkpoint_ns": "ns-1"}}
+    saver.get_tuple(config)
+
+    mock_client.touch.assert_not_called()
+
+
+def test_get_tuple_no_touch_when_refresh_disabled_mocked():
+    """Without refresh_on_read, get_tuple must not touch the __latest__ pointer."""
+    saver, mock_client = _mock_saver({"default_ttl": 60, "refresh_on_read": False})
+
+    config = {
+        "configurable": {"thread_id": "thread-1", "checkpoint_ns": "ns-1", "checkpoint_id": "ck-1"}
+    }
+    saver.get_tuple(config)
+
+    mock_client.touch.assert_not_called()
+
+
+def test_refresh_on_read_without_ttl_warns():
+    """refresh_on_read with no positive default_ttl is a no-op and should warn."""
+    from unittest.mock import MagicMock
+
+    from langgraph.checkpoint.aerospike import AerospikeSaver
+
+    with pytest.warns(UserWarning, match="refresh_on_read"):
+        AerospikeSaver(client=MagicMock(), namespace="test", ttl={"refresh_on_read": True})

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import contextlib
+import warnings
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any, cast
@@ -53,21 +54,24 @@ class AerospikeSaver(BaseCheckpointSaver):
         self.set_cp = set_cp
         self.set_writes = set_writes
         self.set_meta = set_meta
-        self.ttl = ttl or {}
-        self.timeline_max: int | None = None
-        self._ttl_minutes: int | None = self.ttl.get("default_ttl")
-        self._refresh_on_read: bool = bool(self.ttl.get("refresh_on_read", False))
+        ttl = ttl or {}
+        self._ttl_minutes: int | None = ttl.get("default_ttl")
+        self._refresh_on_read: bool = bool(ttl.get("refresh_on_read", False))
+
+        # refresh_on_read needs a positive default_ttl to do anything useful.
+        if self._refresh_on_read and not (self._ttl_minutes and self._ttl_minutes > 0):
+            warnings.warn(
+                "refresh_on_read=True has no effect without a positive "
+                "default_ttl; TTL sliding on read is disabled.",
+                stacklevel=2,
+            )
 
         self._ensure_indexes()
 
     def _ensure_indexes(self) -> None:
-        """Create the secondary indexes ``delete_thread`` relies on.
+        """Create a ``thread_id`` secondary index on each checkpoint set.
 
-        Idempotent: if an index with the same name already exists,
-        ``IndexFoundError`` is raised by the client and silently swallowed.
-        Any other failure (auth, namespace missing, ...) is propagated so
-        misconfiguration surfaces at construction time rather than later
-        when ``delete_thread`` is called.
+        Swallows ``IndexFoundError`` so construction is idempotent.
         """
         for set_name in (self.set_cp, self.set_writes, self.set_meta):
             index_name = f"{set_name}_thread_id_idx"
@@ -110,20 +114,26 @@ class AerospikeSaver(BaseCheckpointSaver):
     def _key_latest(self, thread_id: str, checkpoint_ns: str):
         return (self.ns, self.set_meta, f"{thread_id}{SEP}{checkpoint_ns}{SEP}__latest__")
 
-    def _key_timeline(self, thread_id: str, checkpoint_ns: str):
-        return (self.ns, self.set_meta, f"{thread_id}{SEP}{checkpoint_ns}{SEP}__timeline__")
-
     # ---------- aerospike io ----------
+    def _ttl_seconds(self) -> int | None:
+        """Configured default TTL in seconds, or ``None`` when unset/non-positive."""
+        minutes = self._ttl_minutes
+        if minutes is None:
+            return None
+        seconds = int(minutes) * 60
+        return seconds if seconds > 0 else None
+
+    def _should_refresh(self) -> bool:
+        """True when reads should slide the TTL forward (sliding-TTL mode)."""
+        return self._refresh_on_read and self._ttl_seconds() is not None
+
     def _ttl_policy(self) -> dict[str, Any] | None:
         """Return ``{"ttl": seconds}`` for the configured TTL, or ``None``.
 
         Passed as ``policy=`` to both ``client.put`` and ``client.operate``.
         """
-        minutes = self._ttl_minutes
-        if minutes is None:
-            return None
-        seconds = int(minutes) * 60
-        return {"ttl": seconds} if seconds > 0 else None
+        seconds = self._ttl_seconds()
+        return {"ttl": seconds} if seconds is not None else None
 
     def _put(self, key, bins: dict[str, Any]) -> None:
         policy = self._ttl_policy()
@@ -136,10 +146,8 @@ class AerospikeSaver(BaseCheckpointSaver):
             raise RuntimeError(f"Aerospike put failed for {key}: {e}") from e
 
     def _get(self, key) -> tuple | None:
-        # `read_touch_ttl_percent=100` refreshes the TTL on every
-        # successful read, server-side, in the same round-trip.
         policy: dict[str, Any] | None = None
-        if self._refresh_on_read and self._ttl_minutes is not None and self._ttl_minutes > 0:
+        if self._should_refresh():
             policy = {"read_touch_ttl_percent": 100}
 
         try:
@@ -154,35 +162,46 @@ class AerospikeSaver(BaseCheckpointSaver):
 
         return rec
 
-    def _read_timeline_items(self, timeline_key) -> builtins.list[tuple[str, str]]:
-        """Return timeline entries as ``(iso_timestamp, checkpoint_id)`` pairs.
+    def _touch_latest(self, thread_id: str, checkpoint_ns: str) -> None:
+        """Refresh ``__latest__`` TTL on read-by-id.
 
-        On-disk shape is a Map bin (``timeline``) keyed by
-        ``checkpoint_id`` with ISO-timestamp values. We sort by ``ts``
-        descending here so callers see reverse-chronological order.
+        Read-by-id refreshes the checkpoint and writes records via ``_get``,
+        but it never reads the ``__latest__`` pointer.
         """
-        rec = self._get(timeline_key)
-        if rec is None:
-            return []
-        bins = rec[2]
-        timeline = bins.get("timeline") or {}
-        if not isinstance(timeline, dict):
-            return []
-        pairs: list[tuple[str, str]] = [
-            (ts, cid)
-            for cid, ts in timeline.items()
-            if isinstance(ts, str) and isinstance(cid, str)
-        ]
-        pairs.sort(key=lambda p: p[0], reverse=True)
-        return pairs
-
-    def _delete(self, key) -> None:
+        seconds = self._ttl_seconds()
+        if seconds is None:
+            return
         try:
-            self.client.remove(key)
+            self.client.touch(self._key_latest(thread_id, checkpoint_ns), seconds)
         except aerospike.exception.RecordNotFound:
             pass
         except aerospike.exception.AerospikeError as e:
-            raise RuntimeError(f"Aerospike delete failed for {key}: {e}") from e
+            raise RuntimeError(f"Aerospike touch failed for latest record: {e}") from e
+
+    def _list_checkpoint_ids(
+        self, thread_id: str, checkpoint_ns: str
+    ) -> builtins.list[tuple[str, str]]:
+        """Return ``(iso_timestamp, checkpoint_id)`` for a thread/ns, newest first.
+
+        History is enumerated from checkpoint records through the ``thread_id``
+        index, avoiding a single growing timeline record.
+        """
+        from aerospike import predicates  # local import to avoid global aerospike side-effects
+
+        query = self.client.query(self.ns, self.set_cp)
+        query.where(predicates.equals("thread_id", thread_id))
+        query.select("checkpoint_ns", "checkpoint_id", "ts")
+
+        pairs: list[tuple[str, str]] = []
+        for _key, _meta, bins in query.results():
+            if bins.get("checkpoint_ns") != checkpoint_ns:
+                continue
+            cid = bins.get("checkpoint_id")
+            ts = bins.get("ts")
+            if isinstance(cid, str) and isinstance(ts, str):
+                pairs.append((ts, cid))
+        pairs.sort(key=lambda p: (p[0], p[1]), reverse=True)
+        return pairs
 
     # ---------- public API (RunnableConfig-based) ----------
     def put(
@@ -210,8 +229,11 @@ class AerospikeSaver(BaseCheckpointSaver):
         meta_type, meta_bytes = self.serde.dumps_typed(metadata)
 
         key = self._key_cp(thread_id, checkpoint_ns, checkpoint_id)
+        # Bins duplicate key parts so list() can project them from index query results.
         rec: dict[str, Any] = {
             "thread_id": thread_id,
+            "checkpoint_ns": checkpoint_ns,
+            "checkpoint_id": checkpoint_id,
             "p_checkpoint_id": parent_checkpoint_id,
             "cp_type": cp_type,
             "checkpoint": cp_bytes,
@@ -230,23 +252,6 @@ class AerospikeSaver(BaseCheckpointSaver):
                 "ts": ts,
             },
         )
-
-        timeline_key = self._key_timeline(thread_id, checkpoint_ns)
-        # `map_put` upserts atomically: re-`put()`ing the same
-        # `checkpoint_id` overwrites in place, and concurrent `put()`s
-        # against the same thread/ns can't clobber each other's entries.
-        timeline_ops: list[dict[str, Any]] = [
-            operations.write("thread_id", thread_id),
-            map_operations.map_put("timeline", checkpoint_id, ts),
-        ]
-        timeline_policy = self._ttl_policy()
-        try:
-            if timeline_policy is not None:
-                self.client.operate(timeline_key, timeline_ops, policy=timeline_policy)
-            else:
-                self.client.operate(timeline_key, timeline_ops)
-        except aerospike.exception.AerospikeError as e:
-            raise RuntimeError(f"Aerospike operate failed for {timeline_key}: {e}") from e
 
         cfg_conf: dict[str, Any] = {**(config.get("configurable") or {})}
         cfg_conf.update(
@@ -319,6 +324,7 @@ class AerospikeSaver(BaseCheckpointSaver):
 
         thread_id, checkpoint_ns, checkpoint_id = self._ids_from_config(config)
 
+        resolved_via_latest = checkpoint_id is None
         if checkpoint_id is None:
             latest = self._get(self._key_latest(thread_id, checkpoint_ns))
             if latest is None or "checkpoint_id" not in latest[2]:
@@ -330,9 +336,10 @@ class AerospikeSaver(BaseCheckpointSaver):
         if got is None:
             return None
 
-        # Refresh timeline record TTL if refresh_on_read is configured
-        if self._refresh_on_read and self._ttl_minutes is not None and self._ttl_minutes > 0:
-            self._get(self._key_timeline(thread_id, checkpoint_ns))
+        # If we resolved through __latest__, _get already refreshed it.
+        # Read-by-id does not touch __latest__, so refresh it explicitly.
+        if not resolved_via_latest and self._should_refresh():
+            self._touch_latest(thread_id, checkpoint_ns)
 
         _, _, bins = got
 
@@ -400,13 +407,7 @@ class AerospikeSaver(BaseCheckpointSaver):
         )
 
     def delete_thread(self, thread_id: str) -> None:
-        """Delete every checkpoint, pending-write, and meta record for ``thread_id``.
-
-        Spans every ``checkpoint_ns`` belonging to the thread. Implemented
-        with a per-set secondary-index query on the ``thread_id`` bin
-        (created in ``_ensure_indexes``), so cost is O(records-for-thread)
-        rather than O(set-size).
-        """
+        """Delete every checkpoint, pending-write, and meta record for ``thread_id``."""
         from aerospike import predicates  # local import to avoid global aerospike side-effects
 
         for set_name in (self.set_cp, self.set_writes, self.set_meta):
@@ -435,8 +436,7 @@ class AerospikeSaver(BaseCheckpointSaver):
 
         thread_id, checkpoint_ns, _ = self._ids_from_config(config or {})
 
-        timeline_key = self._key_timeline(thread_id, checkpoint_ns)
-        items = self._read_timeline_items(timeline_key)
+        items = self._list_checkpoint_ids(thread_id, checkpoint_ns)
 
         before_id: str | None = None
         if before is not None:

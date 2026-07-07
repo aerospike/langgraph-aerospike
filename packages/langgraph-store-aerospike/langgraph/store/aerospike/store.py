@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import warnings
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
@@ -71,10 +73,109 @@ class AerospikeStore(BaseStore):
         self.set = set
         self.ttl_config = ttl_config
 
+        # refresh_on_read needs a positive default_ttl to do anything useful.
+        if ttl_config is not None and ttl_config.get("refresh_on_read"):
+            default_ttl = ttl_config.get("default_ttl")
+            if not (default_ttl and default_ttl > 0):
+                warnings.warn(
+                    "refresh_on_read=True has no effect without a positive "
+                    "default_ttl; TTL sliding on read is disabled.",
+                    stacklevel=2,
+                )
+
+        self._ensure_indexes()
+
+    def _ensure_indexes(self) -> None:
+        """Create secondary indexes on ``ns_prefixes`` and ``ns_suffixes``.
+
+        Each item stores denormalized prefix/suffix list bins, so anchored
+        namespace lookups can use CDT list indexes instead of scanning the set.
+        Swallows ``IndexFoundError`` so construction is idempotent.
+        """
+        for bin_name, index_name in (
+            ("ns_prefixes", f"{self.set}_ns_prefixes_idx"),
+            ("ns_suffixes", f"{self.set}_ns_suffixes_idx"),
+        ):
+            with contextlib.suppress(aerospike.exception.IndexFoundError):
+                self.client.index_list_create(
+                    self.ns,
+                    self.set,
+                    bin_name,
+                    aerospike.INDEX_STRING,
+                    index_name,
+                )
+
     # --------------- Aerospike helper functions ------------------
 
     def _key(self, namespace: tuple[str, ...], key: str) -> tuple[str, str, str]:
         return (self.ns, self.set, SEP.join([*namespace, key]))
+
+    @staticmethod
+    def _ns_prefixes(namespace: tuple[str, ...]) -> list[str]:
+        """Joined contiguous prefixes, e.g. ``("a","b","c")`` -> ``["a","a|b","a|b|c"]``.
+
+        Joining with ``SEP`` keeps token boundaries explicit for index values.
+        """
+        return [SEP.join(namespace[: i + 1]) for i in range(len(namespace))]
+
+    @staticmethod
+    def _ns_suffixes(namespace: tuple[str, ...]) -> list[str]:
+        """Joined contiguous suffixes, e.g. ``("a","b","c")`` -> ``["c","b|c","a|b|c"]``."""
+        n = len(namespace)
+        return [SEP.join(namespace[n - i - 1 :]) for i in range(n)]
+
+    @staticmethod
+    def _leading_anchor(path: NamespacePath) -> str | None:
+        """Leading literal tokens before the first ``*``, joined with ``SEP``."""
+        tokens: list[str] = []
+        for token in path:
+            if token == "*":
+                break
+            tokens.append(token)
+        return SEP.join(tokens) if tokens else None
+
+    @staticmethod
+    def _trailing_anchor(path: NamespacePath) -> str | None:
+        """Trailing literal tokens after the last ``*``, joined with ``SEP``."""
+        tokens: list[str] = []
+        for token in reversed(path):
+            if token == "*":
+                break
+            tokens.append(token)
+        tokens.reverse()
+        return SEP.join(tokens) if tokens else None
+
+    def _index_predicate(
+        self, prefix: NamespacePath | None, suffix: NamespacePath | None
+    ) -> Any | None:
+        """Return an index predicate, or ``None`` if the path has no anchor.
+
+        Aerospike queries accept one ``where`` clause. Prefer the prefix index;
+        expression filters still enforce the full prefix/suffix pattern.
+        """
+        from aerospike import predicates  # local import to avoid global aerospike side-effects
+
+        if prefix:
+            anchor = self._leading_anchor(prefix)
+            if anchor is not None:
+                return predicates.contains("ns_prefixes", aerospike.INDEX_TYPE_LIST, anchor)
+        if suffix:
+            anchor = self._trailing_anchor(suffix)
+            if anchor is not None:
+                return predicates.contains("ns_suffixes", aerospike.INDEX_TYPE_LIST, anchor)
+        return None
+
+    def _run_query(self, predicate: Any | None, exprs: list) -> list:
+        """Query the set, optionally narrowed by ``predicate``, filtered by ``exprs``."""
+        query = self.client.query(self.ns, self.set)
+        if predicate is not None:
+            query.where(predicate)
+        policy: dict[str, Any] = {}
+        if len(exprs) == 1:
+            policy["expressions"] = exprs[0].compile()
+        elif exprs:
+            policy["expressions"] = exp.And(*exprs).compile()
+        return query.results(policy=policy)
 
     def _build_read_policy_for_refresh(self, refresh_ttl: bool | None) -> dict[str, Any]:
         policy: dict[str, Any] = {}
@@ -206,6 +307,8 @@ class AerospikeStore(BaseStore):
             operations.write("namespace", list(op.namespace)),
             operations.write("key", op.key),
             operations.write("value", op.value),
+            operations.write("ns_prefixes", self._ns_prefixes(op.namespace)),
+            operations.write("ns_suffixes", self._ns_suffixes(op.namespace)),
             map_operations.map_put(
                 "meta",
                 "created_at",
@@ -231,8 +334,10 @@ class AerospikeStore(BaseStore):
                 _, _, bins = self.client.get(p_key, policy=read_policy)
             else:
                 _, _, bins = self.client.get(p_key)
-        except aerospike.exception.AerospikeError:
+        except aerospike.exception.RecordNotFound:
             return None
+        except aerospike.exception.AerospikeError as e:
+            raise RuntimeError(f"Aerospike get failed for {op.key}: {e}") from e
 
         value = bins.get("value")
         if value is None:
@@ -251,30 +356,25 @@ class AerospikeStore(BaseStore):
     def _handle_search(self, op: SearchOp) -> list[SearchItem]:
         if op.query:
             raise NotImplementedError(
-                "Aerospike v0.1 does not support semantic/vector search. Use search without query."
+                "AerospikeStore does not support semantic/vector search. "
+                "Use search without the `query` argument."
             )
 
-        filter_exprs = []
+        exprs: list = []
         if op.namespace_prefix:
-            filter_exprs.extend(
-                self._build_path_filter(op.namespace_prefix, "namespace", is_suffix=False)
-            )
+            exprs.extend(self._build_path_filter(op.namespace_prefix, "namespace", is_suffix=False))
         if op.filter:
-            filter_exprs.extend(self._build_filter_exprs_from_dict(op.filter))
+            exprs.extend(self._build_filter_exprs_from_dict(op.filter))
 
-        policy: dict[str, Any] = {}
-        if filter_exprs:
-            policy["expressions"] = exp.And(*filter_exprs).compile()
-
+        # The index narrows the candidate set; expressions enforce the exact
+        # namespace prefix and value filters.
+        predicate = self._index_predicate(op.namespace_prefix, None)
         try:
-            scan = self.client.scan(self.ns, self.set)
-            records = scan.results(policy=policy)
+            records = self._run_query(predicate, exprs)
         except aerospike.exception.AerospikeError as e:
             raise RuntimeError(f"Aerospike search failed: {e}") from e
 
-        # If the caller asked us to refresh TTL on read, we have to re-fetch
-        # each matching record with the read-touch policy because `scan`
-        # itself doesn't take that policy.
+        # Re-fetch each match to apply read-touch TTL (queries don't support it).
         read_policy = self._build_read_policy_for_refresh(op.refresh_ttl)
         out: list[SearchItem] = []
 
@@ -282,8 +382,10 @@ class AerospikeStore(BaseStore):
             if read_policy:
                 try:
                     _, _, bins = self.client.get(pkey, policy=read_policy)
-                except aerospike.exception.AerospikeError:
+                except aerospike.exception.RecordNotFound:
                     continue
+                except aerospike.exception.AerospikeError as e:
+                    raise RuntimeError(f"Aerospike search refresh failed: {e}") from e
             ns = tuple(bins.get("namespace", ()))
             key = bins.get("key")
             value = bins.get("value")
@@ -322,21 +424,19 @@ class AerospikeStore(BaseStore):
                 else:
                     raise ValueError(f"Match type {condition.match_type} must be prefix or suffix.")
 
-        filter_exprs = []
+        exprs: list = []
         if prefix:
-            filter_exprs.extend(self._build_path_filter(prefix, "namespace", is_suffix=False))
+            exprs.extend(self._build_path_filter(prefix, "namespace", is_suffix=False))
         if suffix:
-            filter_exprs.extend(self._build_path_filter(suffix, "namespace", is_suffix=True))
+            exprs.extend(self._build_path_filter(suffix, "namespace", is_suffix=True))
 
-        policy: dict[str, Any] = {}
-        if filter_exprs:
-            policy["expressions"] = exp.And(*filter_exprs).compile()
-
+        # Use one namespace index when possible; expression filters handle
+        # wildcards and the other match condition.
+        predicate = self._index_predicate(prefix, suffix)
         try:
-            scan = self.client.scan(self.ns, self.set)
-            records = scan.results(policy=policy)
+            records = self._run_query(predicate, exprs)
         except aerospike.exception.AerospikeError as e:
-            raise RuntimeError(f"Aerospike search failed: {e}") from e
+            raise RuntimeError(f"Aerospike list_namespaces failed: {e}") from e
 
         all_namespaces: set[tuple[str, ...]] = set()
         for _, _, bins in records:
@@ -345,10 +445,7 @@ class AerospikeStore(BaseStore):
                 ns = ns[: op.max_depth]
             all_namespaces.add(ns)
 
-        # Sort before paginating: Aerospike scans return records in
-        # digest-hash order, which is non-deterministic across calls. Without
-        # a stable sort, two consecutive `list_namespaces(limit=N, offset=K)`
-        # calls could overlap or skip entries, making pagination meaningless.
+        # Sort for stable pagination (query order is digest-hash, not lexical).
         result = sorted(all_namespaces)
         if op.offset:
             result = result[op.offset :]
