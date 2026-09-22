@@ -28,7 +28,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from typing import Any
 
-import aerospike
+from aerospike_sdk import Behavior, SyncSession
+from aerospike_sdk.exceptions import AerospikeError
+from aerospike_sdk.sync import ClusterDefinition
 from agent import build_support_graph
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -71,26 +73,26 @@ def _pause() -> None:
 
 # === Step 6: Connect to Aerospike ===
 @contextmanager
-def _connect() -> Iterator[aerospike.Client]:
-    """Open an Aerospike client, guaranteeing it is closed afterwards."""
+def _connect() -> Iterator[SyncSession]:
+    """Open an Aerospike SDK session, guaranteeing it is closed afterwards."""
     try:
-        client = aerospike.client({"hosts": [(AEROSPIKE_HOST, AEROSPIKE_PORT)]}).connect()
-    except aerospike.exception.AerospikeError as exc:
+        cluster = ClusterDefinition(AEROSPIKE_HOST, AEROSPIKE_PORT).connect()
+    except AerospikeError as exc:
         raise SystemExit(
             f"Could not connect to Aerospike at {AEROSPIKE_HOST}:{AEROSPIKE_PORT}. "
             "Confirm your Aerospike server is running and update the constants "
             "at the top of demo.py if needed."
         ) from exc
     try:
-        yield client
+        yield cluster.create_session(Behavior.DEFAULT)
     finally:
-        client.close()
+        cluster.close()
 
 
 # === Step 7: Build the checkpointer ===
-def _build_checkpointer(client: aerospike.Client) -> AerospikeSaver:
+def _build_checkpointer(session: SyncSession) -> AerospikeSaver:
     """Create an AerospikeSaver. No TTL here -- we want the history to persist."""
-    return AerospikeSaver(client=client, namespace=AEROSPIKE_NAMESPACE)
+    return AerospikeSaver(session=session, namespace=AEROSPIKE_NAMESPACE)
 
 
 def _values(tpl: CheckpointTuple | None) -> dict[str, Any]:

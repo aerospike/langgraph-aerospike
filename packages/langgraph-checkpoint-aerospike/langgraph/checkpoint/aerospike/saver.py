@@ -3,12 +3,22 @@ from __future__ import annotations
 import asyncio
 import builtins
 import contextlib
+import logging
 import warnings
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any, cast
 
-from aerospike_helpers.operations import map_operations, operations
+from aerospike_sdk import (
+    AerospikeError,
+    DataSet,
+    Exp,
+    IndexAlreadyExistsError,
+    Key,
+    RecordNotFoundError,
+    SyncSession,
+)
+from aerospike_sdk.sync.cluster import Cluster
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
@@ -20,20 +30,26 @@ from langgraph.checkpoint.base import (
     SerializerProtocol,
 )
 
-import aerospike
-import aerospike.exception  # noqa: F401  # expose `aerospike.exception` submodule for type checkers
+logger = logging.getLogger(__name__)
 
 SEP = "|"
 
 
-def _now_ns() -> datetime:
+def _now_utc() -> datetime:
     return datetime.now(tz=timezone.utc)
+
+
+def _aerospike_message(error: AerospikeError, prefix: str) -> str:
+    """Format an Aerospike error, including its result code when available."""
+    rc = getattr(error, "result_code", None)
+    rc_part = f" (result_code={rc})" if rc is not None else ""
+    return f"{prefix}{rc_part}: {error}"
 
 
 class AerospikeSaver(BaseCheckpointSaver):
     def __init__(
         self,
-        client: aerospike.Client,
+        session: SyncSession,
         namespace: str = "test",
         set_cp: str = "lg_cp",
         set_writes: str = "lg_cp_w",
@@ -41,6 +57,7 @@ class AerospikeSaver(BaseCheckpointSaver):
         ttl: dict[str, Any] | None = None,
         *,
         serde: SerializerProtocol | None = None,
+        cluster: Cluster | None = None,
     ) -> None:
         # `BaseCheckpointSaver.__init__` registers `self.serde`, wrapping it
         # in `maybe_add_typed_methods` for backwards compatibility. Skipping
@@ -49,11 +66,12 @@ class AerospikeSaver(BaseCheckpointSaver):
         # constructor, so always forward.
         super().__init__(serde=serde)
 
-        self.client = client
+        self.session = session
         self.ns = namespace
         self.set_cp = set_cp
         self.set_writes = set_writes
         self.set_meta = set_meta
+        self._cluster = cluster
         ttl = ttl or {}
         self._ttl_minutes: int | None = ttl.get("default_ttl")
         self._refresh_on_read: bool = bool(ttl.get("refresh_on_read", False))
@@ -71,18 +89,22 @@ class AerospikeSaver(BaseCheckpointSaver):
     def _ensure_indexes(self) -> None:
         """Create a ``thread_id`` secondary index on each checkpoint set.
 
-        Swallows ``IndexFoundError`` so construction is idempotent.
+        Swallows ``IndexAlreadyExistsError`` so construction is idempotent.
         """
         for set_name in (self.set_cp, self.set_writes, self.set_meta):
             index_name = f"{set_name}_thread_id_idx"
-            with contextlib.suppress(aerospike.exception.IndexFoundError):
-                self.client.index_single_value_create(
-                    self.ns,
-                    set_name,
-                    "thread_id",
-                    aerospike.INDEX_STRING,
-                    index_name,
-                )
+            with contextlib.suppress(IndexAlreadyExistsError):
+                self.session.index(dataset=DataSet.of(self.ns, set_name)).on_bin(
+                    "thread_id"
+                ).named(index_name).string().create()
+
+    def close(self) -> None:
+        """Close the underlying Aerospike cluster connection if this saver owns it."""
+        if self._cluster is not None:
+            try:
+                self._cluster.close()
+            except Exception:
+                logger.warning("Failed to close Aerospike cluster", exc_info=True)
 
     # ---------- config parsing ----------
     @staticmethod
@@ -105,14 +127,20 @@ class AerospikeSaver(BaseCheckpointSaver):
         return thread_id, checkpoint_ns, checkpoint_id
 
     # ---------- keys ----------
-    def _key_cp(self, thread_id: str, checkpoint_ns: str, checkpoint_id: str):
-        return (self.ns, self.set_cp, f"{thread_id}{SEP}{checkpoint_ns}{SEP}{checkpoint_id}")
+    def _key_cp(self, thread_id: str, checkpoint_ns: str, checkpoint_id: str) -> Key:
+        return DataSet.of(
+            self.ns, self.set_cp
+        ).id(f"{thread_id}{SEP}{checkpoint_ns}{SEP}{checkpoint_id}")
 
-    def _key_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: str):
-        return (self.ns, self.set_writes, f"{thread_id}{SEP}{checkpoint_ns}{SEP}{checkpoint_id}")
+    def _key_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: str) -> Key:
+        return DataSet.of(
+            self.ns, self.set_writes
+        ).id(f"{thread_id}{SEP}{checkpoint_ns}{SEP}{checkpoint_id}")
 
-    def _key_latest(self, thread_id: str, checkpoint_ns: str):
-        return (self.ns, self.set_meta, f"{thread_id}{SEP}{checkpoint_ns}{SEP}__latest__")
+    def _key_latest(self, thread_id: str, checkpoint_ns: str) -> Key:
+        return DataSet.of(
+            self.ns, self.set_meta
+        ).id(f"{thread_id}{SEP}{checkpoint_ns}{SEP}__latest__")
 
     # ---------- aerospike io ----------
     def _ttl_seconds(self) -> int | None:
@@ -127,40 +155,43 @@ class AerospikeSaver(BaseCheckpointSaver):
         """True when reads should slide the TTL forward (sliding-TTL mode)."""
         return self._refresh_on_read and self._ttl_seconds() is not None
 
-    def _ttl_policy(self) -> dict[str, Any] | None:
-        """Return ``{"ttl": seconds}`` for the configured TTL, or ``None``.
-
-        Passed as ``policy=`` to both ``client.put`` and ``client.operate``.
-        """
+    def _ttl_builder(self, builder) -> Any:
+        """Apply TTL policy to a write builder when configured."""
         seconds = self._ttl_seconds()
-        return {"ttl": seconds} if seconds is not None else None
+        if seconds is None:
+            return builder
+        return builder.expire_record_after_seconds(seconds)
 
-    def _put(self, key, bins: dict[str, Any]) -> None:
-        policy = self._ttl_policy()
+    def _put(self, key: Key, bins: dict[str, Any]) -> None:
+        builder = self._ttl_builder(self.session.upsert(key).put(bins))
         try:
-            if policy is not None:
-                self.client.put(key, bins, policy=policy)
-            else:
-                self.client.put(key, bins)
-        except aerospike.exception.AerospikeError as e:
-            raise RuntimeError(f"Aerospike put failed for {key}: {e}") from e
+            builder.execute()
+        except AerospikeError as e:
+            raise RuntimeError(_aerospike_message(e, f"Aerospike put failed for {key.value}")) from e
 
-    def _get(self, key) -> tuple | None:
-        policy: dict[str, Any] | None = None
-        if self._should_refresh():
-            policy = {"read_touch_ttl_percent": 100}
-
+    def _get(self, key: Key) -> Any | None:
         try:
-            if policy is not None:
-                rec = self.client.get(key, policy=policy)
-            else:
-                rec = self.client.get(key)
-        except aerospike.exception.RecordNotFound:
+            record = self.session.get(key)
+        except RecordNotFoundError:
             return None
-        except aerospike.exception.AerospikeError as e:
-            raise RuntimeError(f"Aerospike get failed for {key}: {e}") from e
+        except AerospikeError as e:
+            raise RuntimeError(_aerospike_message(e, f"Aerospike get failed for {key.value}")) from e
 
-        return rec
+        # The SDK sync fast-path ``session.get`` does not expose read policy
+        # overrides, so sliding TTL is implemented as a follow-up ``touch``.
+        if self._should_refresh():
+            seconds = self._ttl_seconds()
+            if seconds is not None:
+                try:
+                    self.session.touch(key).expire_record_after_seconds(seconds).execute()
+                except RecordNotFoundError:
+                    pass
+                except AerospikeError as e:
+                    raise RuntimeError(
+                        _aerospike_message(e, f"Aerospike touch failed for {key.value}")
+                    ) from e
+
+        return record
 
     def _touch_latest(self, thread_id: str, checkpoint_ns: str) -> None:
         """Refresh ``__latest__`` TTL on read-by-id.
@@ -171,12 +202,15 @@ class AerospikeSaver(BaseCheckpointSaver):
         seconds = self._ttl_seconds()
         if seconds is None:
             return
+        key = self._key_latest(thread_id, checkpoint_ns)
         try:
-            self.client.touch(self._key_latest(thread_id, checkpoint_ns), seconds)
-        except aerospike.exception.RecordNotFound:
+            self.session.touch(key).expire_record_after_seconds(seconds).execute()
+        except RecordNotFoundError:
             pass
-        except aerospike.exception.AerospikeError as e:
-            raise RuntimeError(f"Aerospike touch failed for latest record: {e}") from e
+        except AerospikeError as e:
+            raise RuntimeError(
+                _aerospike_message(e, "Aerospike touch failed for latest record")
+            ) from e
 
     def _list_checkpoint_ids(
         self, thread_id: str, checkpoint_ns: str
@@ -186,14 +220,16 @@ class AerospikeSaver(BaseCheckpointSaver):
         History is enumerated from checkpoint records through the ``thread_id``
         index, avoiding a single growing timeline record.
         """
-        from aerospike import predicates  # local import to avoid global aerospike side-effects
-
-        query = self.client.query(self.ns, self.set_cp)
-        query.where(predicates.equals("thread_id", thread_id))
-        query.select("checkpoint_ns", "checkpoint_id", "ts")
+        ds = DataSet.of(self.ns, self.set_cp)
+        stream = self.session.query(ds).where(
+            Exp.eq(Exp.string_bin("thread_id"), Exp.string_val(thread_id))
+        ).bins(["checkpoint_ns", "checkpoint_id", "ts"]).execute()
 
         pairs: list[tuple[str, str]] = []
-        for _key, _meta, bins in query.results():
+        for result in stream:
+            if not result.is_ok or result.record is None:
+                continue
+            bins = result.record.bins
             if bins.get("checkpoint_ns") != checkpoint_ns:
                 continue
             cid = bins.get("checkpoint_id")
@@ -217,9 +253,10 @@ class AerospikeSaver(BaseCheckpointSaver):
             raise ValueError("checkpoint_id is required for put()")
 
         # `Checkpoint.ts` is a required TypedDict field, but be defensive in case
-        # an older serialized format ever omits it.
-        ts: str = checkpoint.get("ts") or _now_ns().isoformat()
-        checkpoint["ts"] = ts
+        # an older serialized format ever omits it. Avoid mutating the caller's
+        # dict by copying before injecting the timestamp.
+        ts: str = checkpoint.get("ts") or _now_utc().isoformat()
+        checkpoint = {**checkpoint, "ts": ts}
 
         cp_type, cp_bytes = self.serde.dumps_typed(checkpoint)
         metadata = metadata.copy()
@@ -274,9 +311,10 @@ class AerospikeSaver(BaseCheckpointSaver):
         """Persist pending writes for a checkpoint.
 
         Each write is stored inside a Map bin (``writes``) keyed by
-        ``f"{task_id}|{idx}"``, written via a single ``client.operate``
-        call. ``map_put`` is server-atomic, giving us upsert-on-retry
-        and tolerating concurrent callers against the same checkpoint.
+        ``f"{task_id}|{idx}"``, written via a single server-side
+        operation chain. ``map_upsert_items`` is server-atomic, giving us
+        upsert-on-retry and tolerating concurrent callers against the same
+        checkpoint.
 
         The ``thread_id`` bin is rewritten on every call so that
         ``delete_thread``'s secondary-index query keeps finding the
@@ -290,9 +328,9 @@ class AerospikeSaver(BaseCheckpointSaver):
             return
 
         key = self._key_writes(thread_id, checkpoint_ns, checkpoint_id)
-        now_ts = _now_ns().isoformat()
+        now_ts = _now_utc().isoformat()
 
-        ops: list[dict[str, Any]] = [operations.write("thread_id", thread_id)]
+        builder = self.session.upsert(key).bin("thread_id").set_to(thread_id)
         for idx, (channel, value) in enumerate(writes):
             idx_val = WRITES_IDX_MAP.get(channel, idx)
             type_, serialized = self.serde.dumps_typed(value)
@@ -306,16 +344,15 @@ class AerospikeSaver(BaseCheckpointSaver):
                 "ts": now_ts,
             }
             map_key = f"{task_id}{SEP}{idx_val}"
-            ops.append(map_operations.map_put("writes", map_key, new_item))
+            builder = builder.bin("writes").map_upsert_items({map_key: new_item})
 
-        policy = self._ttl_policy()
+        builder = self._ttl_builder(builder)
         try:
-            if policy is not None:
-                self.client.operate(key, ops, policy=policy)
-            else:
-                self.client.operate(key, ops)
-        except aerospike.exception.AerospikeError as e:
-            raise RuntimeError(f"Aerospike operate failed for {key}: {e}") from e
+            builder.execute()
+        except AerospikeError as e:
+            raise RuntimeError(
+                _aerospike_message(e, f"Aerospike operate failed for {key.value}")
+            ) from e
 
     def get_tuple(
         self,
@@ -327,9 +364,9 @@ class AerospikeSaver(BaseCheckpointSaver):
         resolved_via_latest = checkpoint_id is None
         if checkpoint_id is None:
             latest = self._get(self._key_latest(thread_id, checkpoint_ns))
-            if latest is None or "checkpoint_id" not in latest[2]:
+            if latest is None or "checkpoint_id" not in latest.bins:
                 return None
-            checkpoint_id = latest[2]["checkpoint_id"]
+            checkpoint_id = latest.bins["checkpoint_id"]
 
         key = self._key_cp(thread_id, checkpoint_ns, checkpoint_id)
         got = self._get(key)
@@ -341,8 +378,17 @@ class AerospikeSaver(BaseCheckpointSaver):
         if not resolved_via_latest and self._should_refresh():
             self._touch_latest(thread_id, checkpoint_ns)
 
-        _, _, bins = got
+        return self._build_tuple(got.bins, thread_id, checkpoint_ns, checkpoint_id)
 
+    def _build_tuple(
+        self,
+        bins: dict[str, Any],
+        thread_id: str,
+        checkpoint_ns: str,
+        checkpoint_id: str,
+        wrec: Any | None = None,
+    ) -> CheckpointTuple | None:
+        """Construct a ``CheckpointTuple`` from checkpoint bins and an optional writes record."""
         cp_type = bins.get("cp_type")
         raw_cp = bins.get("checkpoint")
         raw_meta = bins.get("metadata")
@@ -351,24 +397,27 @@ class AerospikeSaver(BaseCheckpointSaver):
             return None
         try:
             checkpoint = self.serde.loads_typed((cp_type, raw_cp))
-        except Exception:
-            return None
+        except Exception as e:
+            key = self._key_cp(thread_id, checkpoint_ns, checkpoint_id)
+            raise RuntimeError(f"Failed to deserialize checkpoint for {key.value}: {e}") from e
 
         if meta_type is None or raw_meta is None:
             return None
         try:
             metadata = self.serde.loads_typed((meta_type, raw_meta))
-        except Exception:
-            return None
+        except Exception as e:
+            key = self._key_cp(thread_id, checkpoint_ns, checkpoint_id)
+            raise RuntimeError(f"Failed to deserialize metadata for {key.value}: {e}") from e
+
+        if wrec is None:
+            wrec = self._get(self._key_writes(thread_id, checkpoint_ns, checkpoint_id))
 
         pending_writes: list[tuple[str, str, Any]] = []
-        wrec = self._get(self._key_writes(thread_id, checkpoint_ns, checkpoint_id))
         if wrec is not None:
-            _, _, wbins = wrec
             # `writes` is a Map bin (see `put_writes`); each value
             # carries its own `task_id`, `channel`, and `idx`, so we
             # don't depend on map iteration order.
-            writes_map = wbins.get("writes") or {}
+            writes_map = wrec.bins.get("writes") or {}
             for item in writes_map.values():
                 try:
                     task_id = item.get("task_id", "")
@@ -406,24 +455,46 @@ class AerospikeSaver(BaseCheckpointSaver):
             pending_writes=pending_writes,
         )
 
+    def _batch_read_records(
+        self, keys: builtins.list[Any]
+    ) -> dict[str, Any]:
+        """Batch-read ``keys`` and map them by ``key.value``."""
+        by_key: dict[str, Any] = {}
+        if not keys:
+            return by_key
+        try:
+            stream = self.session.query(keys_list=keys).execute()
+        except AerospikeError as e:
+            raise RuntimeError(
+                _aerospike_message(e, "Aerospike batch read failed")
+            ) from e
+        for result in stream:
+            # ``result.record.key`` is not populated on a key-read; use the
+            # request key carried by ``result.key`` instead.
+            if result.is_ok and result.record is not None and result.key is not None:
+                by_key[result.key.value] = result.record
+        return by_key
+
     def delete_thread(self, thread_id: str) -> None:
         """Delete every checkpoint, pending-write, and meta record for ``thread_id``."""
-        from aerospike import predicates  # local import to avoid global aerospike side-effects
-
         for set_name in (self.set_cp, self.set_writes, self.set_meta):
+            ds = DataSet.of(self.ns, set_name)
             digests: builtins.list[bytes] = []
+            stream = self.session.query(ds).where(
+                Exp.eq(Exp.string_bin("thread_id"), Exp.string_val(thread_id))
+            ).with_no_bins().execute()
+            for result in stream:
+                if result.is_ok and result.record is not None:
+                    digests.append(result.record.key.digest)
 
-            def _collect(record: tuple, _digests: builtins.list[bytes] = digests) -> None:
-                (_, _, _, digest), _meta, _bins = record
-                _digests.append(digest)
-
-            query = self.client.query(self.ns, set_name)
-            query.where(predicates.equals("thread_id", thread_id))
-            query.foreach(_collect)
-
-            for digest in digests:
-                with contextlib.suppress(aerospike.exception.RecordNotFound):
-                    self.client.remove((self.ns, set_name, None, digest))
+            if digests:
+                keys = [ds.id_from_digest(digest) for digest in digests]
+                try:
+                    self.session.delete(*keys).execute()
+                except AerospikeError as e:
+                    raise RuntimeError(
+                        _aerospike_message(e, f"Aerospike delete failed for thread {thread_id}")
+                    ) from e
 
     def list(
         self,
@@ -453,20 +524,33 @@ class AerospikeSaver(BaseCheckpointSaver):
                 new_items.append((ts, cid))
             items = new_items
 
+        # Batch-read checkpoint records and pending-writes records in two
+        # round-trips instead of issuing a pair of single-key reads per
+        # checkpoint.
+        cp_keys = [self._key_cp(thread_id, checkpoint_ns, cid) for _, cid in items]
+        writes_keys = [self._key_writes(thread_id, checkpoint_ns, cid) for _, cid in items]
+        cp_records = self._batch_read_records(cp_keys)
+        writes_records = self._batch_read_records(writes_keys)
+
+        # If read refresh is enabled, ``get_tuple`` would normally refresh the
+        # per-thread ``__latest__`` pointer; for a list we refresh it once.
+        if self._should_refresh():
+            self._touch_latest(thread_id, checkpoint_ns)
+
         yielded = 0
         for _, cid in items:
             if limit is not None and yielded >= limit:
                 break
 
-            cp_config: RunnableConfig = {
-                "configurable": {
-                    "thread_id": thread_id,
-                    "checkpoint_ns": checkpoint_ns,
-                    "checkpoint_id": cid,
-                }
-            }
+            cp_key = self._key_cp(thread_id, checkpoint_ns, cid)
+            cp_rec = cp_records.get(cp_key.value)
+            if cp_rec is None:
+                continue
 
-            tpl = self.get_tuple(cp_config)
+            writes_key = self._key_writes(thread_id, checkpoint_ns, cid)
+            wrec = writes_records.get(writes_key.value)
+
+            tpl = self._build_tuple(cp_rec.bins, thread_id, checkpoint_ns, cid, wrec=wrec)
             if tpl is None:
                 continue
 

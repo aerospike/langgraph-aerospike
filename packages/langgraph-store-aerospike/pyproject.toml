@@ -22,9 +22,17 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Database",
 ]
+# `aerospike-sdk` here is the published PyPI release, which covers every
+# non-vector code path. Vector search (`store.search(query=...)`) additionally
+# needs `Vector`/`Exp.vector_bin`/Top-K support, which as of this writing only
+# exists on the unmerged `aie/vector` branch of
+# https://github.com/aerospike/aerospike-client-python-sdk - not on PyPI, so it
+# can't be pinned here (PyPI rejects direct URL/VCS references in published
+# metadata). Install that branch explicitly to use vector search; see
+# VECTOR_SEARCH.md.
 dependencies = [
   "langgraph>=1.0",
-  "aerospike>=15.0",
+  "aerospike-sdk>=0.9.0a5",
 ]
 
 [project.optional-dependencies]

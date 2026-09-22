@@ -44,8 +44,8 @@ File map for `demo.py` (Steps 6–12):
 ```text
 demo.py
 ├── Constants:  AEROSPIKE_HOST, THREAD_ID, ORIGINAL_REQUEST, CORRECTED_REQUEST, ...
-├── Step 6:  _connect() -> Iterator[aerospike.Client]
-├── Step 7:  _build_checkpointer(client) -> AerospikeSaver
+├── Step 6:  _connect() -> Iterator[SyncSession]
+├── Step 7:  _build_checkpointer(session) -> AerospikeSaver
 ├── Step 8:  _resolve(graph, config, text) -> SupportOutcome
 └── main() -> int
     ├── Step 9:   list checkpoint history (Phase 3)
@@ -252,18 +252,22 @@ The checkpointer is passed in so `demo.py` can supply an Aerospike-backed one.
 
 ## Step 6 — Connect to Aerospike
 
-**What this step does:** Open a client, wrapped in a context manager so it is
+**What this step does:** Open a session, wrapped in a context manager so it is
 always closed, and turn a connection failure into a clear message. Connection
 settings are typed constants at the top of `demo.py`.
 
 ```python
+from aerospike_sdk import Behavior, SyncSession
+from aerospike_sdk.sync import ClusterDefinition
+
+
 @contextmanager
-def _connect() -> Iterator[aerospike.Client]:
-    client = aerospike.client({"hosts": [(AEROSPIKE_HOST, AEROSPIKE_PORT)]}).connect()
+def _connect() -> Iterator[SyncSession]:
+    cluster = ClusterDefinition(AEROSPIKE_HOST, AEROSPIKE_PORT).connect()
     try:
-        yield client
+        yield cluster.create_session(Behavior.DEFAULT)
     finally:
-        client.close()
+        cluster.close()
 ```
 
 **In the code:** `demo.py`, `# === Step 6 ===`. Edit the constants to match your
@@ -277,8 +281,8 @@ environment.
 TTL — the checkpoint history must persist so you can travel back through it.
 
 ```python
-def _build_checkpointer(client: aerospike.Client) -> AerospikeSaver:
-    return AerospikeSaver(client=client, namespace=AEROSPIKE_NAMESPACE)
+def _build_checkpointer(session: SyncSession) -> AerospikeSaver:
+    return AerospikeSaver(session=session, namespace=AEROSPIKE_NAMESPACE)
 ```
 
 **In the code:** `demo.py`, `# === Step 7 ===`. A stable `THREAD_ID` and
