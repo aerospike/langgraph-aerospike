@@ -66,11 +66,13 @@ pip install -U langgraph-checkpoint-aerospike langgraph-store-aerospike
 ### 3. Use the Checkpoint Saver
 
 ```python
-import aerospike
+from aerospike_sdk import Behavior
+from aerospike_sdk.sync import ClusterDefinition
 from langgraph.checkpoint.aerospike import AerospikeSaver
 
-client = aerospike.client({"hosts": [("127.0.0.1", 3000)]}).connect()
-saver = AerospikeSaver(client=client, namespace="test")
+cluster = ClusterDefinition("127.0.0.1", 3000).connect()
+session = cluster.create_session(Behavior.DEFAULT)
+saver = AerospikeSaver(session=session, namespace="test")
 
 compiled = graph.compile(checkpointer=saver)
 compiled.invoke({"input": "hello"}, config={"configurable": {"thread_id": "demo"}})
@@ -79,11 +81,13 @@ compiled.invoke({"input": "hello"}, config={"configurable": {"thread_id": "demo"
 ### 4. Use the Store
 
 ```python
-import aerospike
+from aerospike_sdk import Behavior
+from aerospike_sdk.sync import ClusterDefinition
 from langgraph.store.aerospike import AerospikeStore
 
-client = aerospike.client({"hosts": [("127.0.0.1", 3000)]}).connect()
-store = AerospikeStore(client=client, namespace="test", set="langgraph_store")
+cluster = ClusterDefinition("127.0.0.1", 3000).connect()
+session = cluster.create_session(Behavior.DEFAULT)
+store = AerospikeStore(session=session, namespace="test", set="langgraph_store")
 
 store.put(namespace=("users", "profiles"), key="user_123", value={"name": "Alice", "age": 30})
 item = store.get(namespace=("users", "profiles"), key="user_123")

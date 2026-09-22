@@ -27,7 +27,8 @@ docker run -d --name aerospike -p 3000-3002:3000-3002 container.aerospike.com/ae
    ```python
    from typing import Annotated, TypedDict
 
-   import aerospike
+   from aerospike_sdk import Behavior
+   from aerospike_sdk.sync import ClusterDefinition
    from langgraph.graph import START, END, StateGraph
    from langgraph.graph.message import add_messages
    from langchain_core.messages import HumanMessage
@@ -35,8 +36,9 @@ docker run -d --name aerospike -p 3000-3002:3000-3002 container.aerospike.com/ae
    from langgraph.checkpoint.aerospike import AerospikeSaver
 
    # 1. Connect to Aerospike and build the checkpointer.
-   client = aerospike.client({"hosts": [("127.0.0.1", 3000)]}).connect()
-   checkpointer = AerospikeSaver(client=client, namespace="test")
+   cluster = ClusterDefinition("127.0.0.1", 3000).connect()
+   session = cluster.create_session(Behavior.DEFAULT)
+   checkpointer = AerospikeSaver(session=session, namespace="test")
 
 
    # 2. Define a minimal LangGraph graph.

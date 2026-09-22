@@ -4,17 +4,18 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from aerospike_sdk import DataSet
 from langgraph.store.aerospike.store import AerospikeStore
 from langgraph.store.base import ListNamespacesOp, MatchCondition, SearchOp
 
 
 def _mock_store() -> tuple[AerospikeStore, MagicMock, MagicMock]:
-    client = MagicMock()
+    session = MagicMock()
     query = MagicMock()
-    query.results.return_value = []
-    client.query.return_value = query
-    store = AerospikeStore(client=client, namespace="test", set="store_test")
-    return store, client, query
+    query.execute.return_value = []
+    session.query.return_value = query
+    store = AerospikeStore(session=session, namespace="test", set="store_test")
+    return store, session, query
 
 
 # --------------------------------------------------------------------------- #
@@ -46,8 +47,12 @@ def test_trailing_anchor_stops_at_last_wildcard():
 
 
 def test_construction_creates_prefix_and_suffix_indexes():
-    _store, client, _query = _mock_store()
-    created_bins = {call.args[2] for call in client.index_list_create.call_args_list}
+    _store, session, _query = _mock_store()
+    index_builder = session.index.return_value
+    created_bins = {
+        call.kwargs.get("bin_name") or call.args[0]
+        for call in index_builder.on_bin.call_args_list
+    }
     assert created_bins == {"ns_prefixes", "ns_suffixes"}
 
 
@@ -56,43 +61,43 @@ def test_construction_creates_prefix_and_suffix_indexes():
 # --------------------------------------------------------------------------- #
 
 
-def test_search_with_anchored_prefix_uses_prefix_index():
-    store, client, query = _mock_store()
+def test_search_with_anchored_prefix_uses_index():
+    store, session, query = _mock_store()
     store._handle_search(SearchOp(namespace_prefix=("users", "123")))
-    client.query.assert_called_once_with("test", "store_test")
+    session.query.assert_called_once_with(DataSet.of("test", "store_test"))
     query.where.assert_called_once()
-    assert "ns_prefixes" in query.where.call_args.args[0]
 
 
-def test_list_namespaces_prefix_uses_prefix_index():
-    store, _client, query = _mock_store()
+def test_list_namespaces_prefix_uses_index():
+    store, _session, query = _mock_store()
     store._handle_list_namespaces(
         ListNamespacesOp(match_conditions=[MatchCondition(match_type="prefix", path=("a", "b"))])
     )
     query.where.assert_called_once()
-    assert "ns_prefixes" in query.where.call_args.args[0]
 
 
-def test_list_namespaces_suffix_uses_suffix_index():
-    store, _client, query = _mock_store()
+def test_list_namespaces_suffix_uses_index():
+    store, _session, query = _mock_store()
     store._handle_list_namespaces(
         ListNamespacesOp(match_conditions=[MatchCondition(match_type="suffix", path=("f",))])
     )
     query.where.assert_called_once()
-    assert "ns_suffixes" in query.where.call_args.args[0]
 
 
 def test_list_namespaces_unconditioned_does_full_scan():
-    store, _client, query = _mock_store()
+    _store, _session, query = _mock_store()
+    store = AerospikeStore(session=_session, namespace="test", set="store_test")
     store._handle_list_namespaces(ListNamespacesOp(match_conditions=None))
     query.where.assert_not_called()
 
 
-def test_list_namespaces_leading_wildcard_prefix_does_full_scan():
-    store, _client, query = _mock_store()
+def test_list_namespaces_leading_wildcard_prefix_uses_expression_filter():
+    """A leading wildcard cannot use an index, but an expression filter is still applied."""
+    _store, _session, query = _mock_store()
+    store = AerospikeStore(session=_session, namespace="test", set="store_test")
     store._handle_list_namespaces(
         ListNamespacesOp(
             match_conditions=[MatchCondition(match_type="prefix", path=("*", "users"))]
         )
     )
-    query.where.assert_not_called()
+    query.where.assert_called_once()

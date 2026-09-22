@@ -17,9 +17,10 @@ import asyncio
 import contextlib
 import os
 
-import aerospike
-import aerospike.exception
 import pytest
+from aerospike_sdk import Behavior, DataSet
+from aerospike_sdk.exceptions import AerospikeError
+from aerospike_sdk.sync import ClusterDefinition
 from langgraph.checkpoint.aerospike import AerospikeSaver
 from langgraph.checkpoint.conformance import checkpointer_test, validate
 from langgraph.checkpoint.conformance.report import ProgressCallbacks
@@ -34,28 +35,36 @@ _NAMESPACE = os.getenv("AEROSPIKE_NAMESPACE", "test")
 _SETS = ("lg_cp", "lg_cp_w", "lg_cp_meta")
 
 
-def _connect() -> aerospike.Client:
-    return aerospike.client({"hosts": [(_HOST, _PORT)]}).connect()
+def _connect():
+    return ClusterDefinition(_HOST, _PORT).connect()
 
 
-def _truncate_all(client: aerospike.Client) -> None:
+def _truncate_all(session) -> None:
     """Wipe every checkpoint-related set so the suite starts from empty."""
     for s in _SETS:
-        with contextlib.suppress(aerospike.exception.AerospikeError):
-            client.truncate(_NAMESPACE, s, 0)
+        ds = DataSet.of(_NAMESPACE, s)
+        with contextlib.suppress(AerospikeError):
+            session.truncate(ds, before_nanos=0)
 
 
 @checkpointer_test(name="AerospikeSaver")
 async def aerospike_checkpointer():
-    """Async-generator factory the conformance suite calls per test set."""
-    client = _connect()
-    _truncate_all(client)
+    """Async-generator factory the conformance suite calls per test set.
+
+    The synchronous Aerospike SDK cannot be used directly inside a running
+    asyncio event loop, so all blocking setup and teardown is offloaded to
+    worker threads via ``asyncio.to_thread``.
+    """
+    cluster = await asyncio.to_thread(_connect)
+    session = await asyncio.to_thread(cluster.create_session, Behavior.DEFAULT)
+    await asyncio.to_thread(_truncate_all, session)
+    saver = await asyncio.to_thread(AerospikeSaver, session, _NAMESPACE)
     try:
-        yield AerospikeSaver(client=client, namespace=_NAMESPACE)
+        yield saver
     finally:
-        _truncate_all(client)
+        await asyncio.to_thread(_truncate_all, session)
         with contextlib.suppress(Exception):
-            client.close()
+            await asyncio.to_thread(cluster.close)
 
 
 def test_aerospike_saver_passes_base_conformance():
@@ -66,8 +75,9 @@ def test_aerospike_saver_passes_base_conformance():
     when those are added, the suite picks them up automatically.
     """
     try:
-        _connect().close()
-    except aerospike.exception.AerospikeError as e:
+        cluster = _connect()
+        cluster.close()
+    except AerospikeError as e:
         pytest.skip(f"Could not connect to Aerospike: {e}")
 
     report = asyncio.run(
