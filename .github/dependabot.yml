@@ -9,6 +9,11 @@ updates:
       - "dependencies"
       - "github-actions"
 
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+
   # Add additional package ecosystems as needed for your project
   # Python dependencies (uncomment if using Python)
   # - package-ecosystem: "pip"
