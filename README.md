@@ -28,7 +28,7 @@ Both demos use deterministic stubs instead of a live LLM. No API key is required
 To run a working demo in under five minutes:
 
 ```bash
-docker run -d --name aerospike -p 3000-3002:3000-3002 container.aerospike.com/aerospike/aerospike-server
+docker run -d --name aerospike -p 3000-3002:3000-3002 aerospike/aerospike-server
 uv sync
 uv run python cookbooks/expiring-chat-sessions/demo.py --skip-wait
 ```
@@ -46,7 +46,7 @@ Aerospike Community Edition (the default Docker image above) is sufficient for a
 
 - Python >= 3.10
 - Aerospike Server (or the [Docker image](https://hub.docker.com/_/aerospike))
-- `aerospike` Python client >= 15
+- `aerospike-sdk`
 - `langgraph` >= 1.0
 
 ## Quickstart
@@ -54,7 +54,7 @@ Aerospike Community Edition (the default Docker image above) is sufficient for a
 ### 1. Start Aerospike
 
 ```bash
-docker run -d --name aerospike -p 3000-3002:3000-3002 container.aerospike.com/aerospike/aerospike-server
+docker run -d --name aerospike -p 3000-3002:3000-3002 aerospike/aerospike-server
 ```
 
 ### 2. Install
@@ -66,11 +66,13 @@ pip install -U langgraph-checkpoint-aerospike langgraph-store-aerospike
 ### 3. Use the Checkpoint Saver
 
 ```python
-import aerospike
+from aerospike_sdk import Behavior
+from aerospike_sdk.sync import ClusterDefinition
 from langgraph.checkpoint.aerospike import AerospikeSaver
 
-client = aerospike.client({"hosts": [("127.0.0.1", 3000)]}).connect()
-saver = AerospikeSaver(client=client, namespace="test")
+cluster = ClusterDefinition("127.0.0.1", 3000).connect()
+session = cluster.create_session(Behavior.DEFAULT)
+saver = AerospikeSaver(session=session, namespace="test")
 
 compiled = graph.compile(checkpointer=saver)
 compiled.invoke({"input": "hello"}, config={"configurable": {"thread_id": "demo"}})
@@ -79,11 +81,13 @@ compiled.invoke({"input": "hello"}, config={"configurable": {"thread_id": "demo"
 ### 4. Use the Store
 
 ```python
-import aerospike
+from aerospike_sdk import Behavior
+from aerospike_sdk.sync import ClusterDefinition
 from langgraph.store.aerospike import AerospikeStore
 
-client = aerospike.client({"hosts": [("127.0.0.1", 3000)]}).connect()
-store = AerospikeStore(client=client, namespace="test", set="langgraph_store")
+cluster = ClusterDefinition("127.0.0.1", 3000).connect()
+session = cluster.create_session(Behavior.DEFAULT)
+store = AerospikeStore(session=session, namespace="test", set="langgraph_store")
 
 store.put(namespace=("users", "profiles"), key="user_123", value={"name": "Alice", "age": 30})
 item = store.get(namespace=("users", "profiles"), key="user_123")

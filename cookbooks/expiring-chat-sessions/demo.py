@@ -22,7 +22,9 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-import aerospike
+from aerospike_sdk import Behavior, SyncSession
+from aerospike_sdk.exceptions import AerospikeError, RecordNotFoundError
+from aerospike_sdk.sync import ClusterDefinition
 from agent import build_chat_graph
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -51,27 +53,27 @@ def _hr(title: str) -> None:
 
 # === Step 4: Connect to Aerospike ===
 @contextmanager
-def _connect() -> Iterator[aerospike.Client]:
-    """Open an Aerospike client, guaranteeing it is closed afterwards."""
+def _connect() -> Iterator[SyncSession]:
+    """Open an Aerospike SDK session, guaranteeing it is closed afterwards."""
     try:
-        client = aerospike.client({"hosts": [(AEROSPIKE_HOST, AEROSPIKE_PORT)]}).connect()
-    except aerospike.exception.AerospikeError as exc:
+        cluster = ClusterDefinition(AEROSPIKE_HOST, AEROSPIKE_PORT).connect()
+    except AerospikeError as exc:
         raise SystemExit(
             f"Could not connect to Aerospike at {AEROSPIKE_HOST}:{AEROSPIKE_PORT}. "
             "Confirm your Aerospike server is running and update the constants "
             "at the top of demo.py if needed."
         ) from exc
     try:
-        yield client
+        yield cluster.create_session(Behavior.DEFAULT)
     finally:
-        client.close()
+        cluster.close()
 
 
 # === Step 5: Configure the checkpointer with a TTL (the heart of the cookbook) ===
-def _build_checkpointer(client: aerospike.Client) -> AerospikeSaver:
+def _build_checkpointer(session: SyncSession) -> AerospikeSaver:
     """Create an AerospikeSaver that applies a native TTL to every checkpoint."""
     return AerospikeSaver(
-        client=client,
+        session=session,
         namespace=AEROSPIKE_NAMESPACE,
         ttl={
             "default_ttl": CHAT_TTL_MINUTES,
@@ -83,7 +85,7 @@ def _build_checkpointer(client: aerospike.Client) -> AerospikeSaver:
 # === Step 7: Read the TTL back off the stored checkpoint ===
 def _checkpoint_ttl_seconds(
     saver: AerospikeSaver,
-    client: aerospike.Client,
+    session: SyncSession,
     config: RunnableConfig,
 ) -> int | None:
     """Read the raw TTL (seconds) Aerospike holds for the latest checkpoint.
@@ -97,11 +99,10 @@ def _checkpoint_ttl_seconds(
     conf = tpl.config["configurable"]
     key = saver._key_cp(conf["thread_id"], conf["checkpoint_ns"], conf["checkpoint_id"])
     try:
-        _, meta, _ = client.get(key)
-    except aerospike.exception.RecordNotFound:
+        record = session.get(key)
+    except RecordNotFoundError:
         return None
-    ttl = meta.get("ttl")
-    return ttl if isinstance(ttl, int) else None
+    return record.ttl
 
 
 # === Step 6: Run one chat turn and persist it ===
@@ -125,9 +126,9 @@ def main() -> int:
 
     config: RunnableConfig = {"configurable": {"thread_id": THREAD_ID}}
 
-    with _connect() as client:
+    with _connect() as session:
         # Step 6: combine the graph (Steps 1-3) with the TTL checkpointer (Step 5).
-        saver = _build_checkpointer(client)
+        saver = _build_checkpointer(session)
         graph = build_chat_graph(saver)
 
         _hr("Phase 1 - Configure TTL")
@@ -143,7 +144,7 @@ def main() -> int:
         _hr("Phase 2 - Start a chat session")
         count = _say(graph, config, "Hello, I need help with my order.")
         print(f"  messages stored  : {count}")
-        ttl = _checkpoint_ttl_seconds(saver, client, config)
+        ttl = _checkpoint_ttl_seconds(saver, session, config)
         print(f"  checkpoint TTL   : {ttl} seconds (set natively by Aerospike)")
 
         # === Step 8: Resume the same thread (history is preserved) ===
@@ -167,7 +168,7 @@ def main() -> int:
         _hr("Phase 5 - Prove the state expired")
         tpl = saver.get_tuple(config)
         print(f"  get_tuple()      : {tpl!r}")
-        ttl = _checkpoint_ttl_seconds(saver, client, config)
+        ttl = _checkpoint_ttl_seconds(saver, session, config)
         print(f"  raw record       : {'gone' if ttl is None else f'still here (ttl={ttl})'}")
 
         if tpl is not None:

@@ -1,9 +1,10 @@
 import contextlib
 import os
 
-import aerospike
-import aerospike.exception
 import pytest
+from aerospike_sdk import Behavior, DataSet
+from aerospike_sdk.exceptions import AerospikeError
+from aerospike_sdk.sync import ClusterDefinition
 
 # Single shared set name. Tests that need isolation get it from the
 # `truncate_sets` fixture clearing this set before/after every test.
@@ -11,18 +12,18 @@ _STORE_SET = "store_test"
 
 
 @pytest.fixture(scope="session")
-def client():
-    """Single Aerospike client shared across the whole test session."""
+def session():
+    """Single Aerospike SDK session shared across the whole test session."""
     host = os.getenv("AEROSPIKE_HOST", "127.0.0.1")
     port = int(os.getenv("AEROSPIKE_PORT", "3000"))
-    cfg = {"hosts": [(host, port)]}
     try:
-        c = aerospike.client(cfg).connect()
-    except aerospike.exception.AerospikeError as e:
+        cluster = ClusterDefinition(host, port).connect()
+    except AerospikeError as e:
         pytest.skip(f"Could not connect to Aerospike at {host}:{port}: {e}")
-    yield c
+    sess = cluster.create_session(Behavior.DEFAULT)
+    yield sess
     with contextlib.suppress(Exception):
-        c.close()
+        cluster.close()
 
 
 @pytest.fixture(scope="session")
@@ -32,7 +33,7 @@ def namespace():
 
 
 @pytest.fixture()
-def truncate_sets(client, namespace):
+def truncate_sets(session, namespace):
     """Return a callable that truncates the given Aerospike sets.
 
     Truncate is the idiomatic Aerospike way to wipe state: a single
@@ -42,19 +43,47 @@ def truncate_sets(client, namespace):
 
     def _do(sets):
         for s in sets:
-            with contextlib.suppress(aerospike.exception.AerospikeError):
-                client.truncate(namespace, s, 0)
+            ds = DataSet.of(namespace, s)
+            with contextlib.suppress(AerospikeError):
+                session.truncate(ds, before_nanos=0)
 
     return _do
 
 
+@pytest.fixture(scope="session")
+def vector_session():
+    """Sync `aerospike_sdk` session retained for backward compatibility.
+
+    The main ``session`` fixture is now an SDK session and can read/write
+    VECTOR bins directly, so this is no longer required. It is kept so any
+    existing tests that request it still get a working SDK session.
+    """
+    host = os.getenv("AEROSPIKE_HOST", "127.0.0.1")
+    port = int(os.getenv("AEROSPIKE_PORT", "3000"))
+    try:
+        cluster = ClusterDefinition(host, port).connect()
+    except Exception:
+        yield None
+        return
+    try:
+        yield cluster.create_session(Behavior.DEFAULT)
+    finally:
+        with contextlib.suppress(Exception):
+            cluster.close()
+
+
 @pytest.fixture()
-def store(client, namespace, truncate_sets):
+def store(session, namespace, truncate_sets, vector_session):
     """Yield a freshly-truncated `AerospikeStore` for each test."""
     from langgraph.store.aerospike.store import AerospikeStore
 
     truncate_sets((_STORE_SET,))
     try:
-        yield AerospikeStore(client=client, namespace=namespace, set=_STORE_SET)
+        yield AerospikeStore(
+            session=session,
+            namespace=namespace,
+            set=_STORE_SET,
+            vector_session=vector_session,
+        )
     finally:
         truncate_sets((_STORE_SET,))

@@ -82,11 +82,11 @@ def joke_subjects() -> OverallState:
 
 
 @pytest.fixture()
-def aerospike_saver(client, aerospike_namespace, truncate_sets):
+def aerospike_saver(session, aerospike_namespace, truncate_sets):
     """Yield an `AerospikeSaver` on dedicated sets, truncated each test."""
     truncate_sets(_FANOUT_SETS)
     saver = AerospikeSaver(
-        client=client,
+        session=session,
         namespace=aerospike_namespace,
         set_cp=_FANOUT_SETS[0],
         set_writes=_FANOUT_SETS[1],

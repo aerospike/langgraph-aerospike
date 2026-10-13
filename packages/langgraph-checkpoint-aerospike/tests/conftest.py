@@ -1,21 +1,15 @@
 import contextlib
 import os
 
-import aerospike
-import aerospike.exception
 import pytest
+from aerospike_sdk import Behavior, DataSet
+from aerospike_sdk.exceptions import AerospikeError
+from aerospike_sdk.sync import ClusterDefinition
 
 # Default sets `AerospikeSaver` writes to. Tests that use the shared `saver`
 # fixture target these; tests that override the set names (e.g.
 # `test_fanout_aerospike`) must clean up their own sets.
 _DEFAULT_CHECKPOINT_SETS = ("lg_cp", "lg_cp_w", "lg_cp_meta")
-
-
-def _connect_client():
-    host = os.getenv("AEROSPIKE_HOST", "localhost")
-    port = int(os.getenv("AEROSPIKE_PORT", "3000"))
-    cfg = {"hosts": [(host, port)]}
-    return aerospike.client(cfg).connect()
 
 
 @pytest.fixture(scope="session")
@@ -24,14 +18,18 @@ def aerospike_namespace():
 
 
 @pytest.fixture(scope="session")
-def client():
+def session():
+    """Single shared Aerospike SDK session for the whole test session."""
+    host = os.getenv("AEROSPIKE_HOST", "localhost")
+    port = int(os.getenv("AEROSPIKE_PORT", "3000"))
     try:
-        c = _connect_client()
-    except aerospike.exception.AerospikeError as e:
-        pytest.skip(f"Could not connect to Aerospike: {e}")
-    yield c
+        cluster = ClusterDefinition(host, port).connect()
+    except AerospikeError as e:
+        pytest.skip(f"Could not connect to Aerospike at {host}:{port}: {e}")
+    sess = cluster.create_session(Behavior.DEFAULT)
+    yield sess
     with contextlib.suppress(Exception):
-        c.close()
+        cluster.close()
 
 
 @pytest.fixture(scope="session")
@@ -42,7 +40,7 @@ def aerospike_saver_cls():
 
 
 @pytest.fixture()
-def truncate_sets(client, aerospike_namespace):
+def truncate_sets(session, aerospike_namespace):
     """Return a callable that truncates the given Aerospike sets.
 
     Used by per-test fixtures to wipe state before/after each test.
@@ -54,8 +52,9 @@ def truncate_sets(client, aerospike_namespace):
 
     def _do(sets):
         for s in sets:
-            with contextlib.suppress(aerospike.exception.AerospikeError):
-                client.truncate(aerospike_namespace, s, 0)
+            ds = DataSet.of(aerospike_namespace, s)
+            with contextlib.suppress(AerospikeError):
+                session.truncate(ds, before_nanos=0)
 
     return _do
 
@@ -76,11 +75,11 @@ def _test_ttl_config() -> dict:
 
 
 @pytest.fixture()
-def saver(aerospike_saver_cls, client, aerospike_namespace, truncate_sets):
+def saver(aerospike_saver_cls, session, aerospike_namespace, truncate_sets):
     """Yield a fresh `AerospikeSaver` with the default sets pre-truncated."""
     truncate_sets(_DEFAULT_CHECKPOINT_SETS)
     s = aerospike_saver_cls(
-        client=client,
+        session=session,
         namespace=aerospike_namespace,
         ttl=_test_ttl_config(),
     )

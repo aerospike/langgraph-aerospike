@@ -44,7 +44,7 @@ _AEROSPIKE_SET = "store_spec"
 
 
 @pytest.fixture(params=["inmemory", "aerospike"])
-def spec_store(request, client, namespace, truncate_sets):
+def spec_store(request, session, namespace, truncate_sets):
     """Yield a freshly-emptied store for each backend under test.
 
     Parameterized so every test runs once against ``InMemoryStore`` (the
@@ -58,7 +58,7 @@ def spec_store(request, client, namespace, truncate_sets):
 
     truncate_sets((_AEROSPIKE_SET,))
     try:
-        yield AerospikeStore(client=client, namespace=namespace, set=_AEROSPIKE_SET), label
+        yield AerospikeStore(session=session, namespace=namespace, set=_AEROSPIKE_SET), label
     finally:
         truncate_sets((_AEROSPIKE_SET,))
 
@@ -399,15 +399,16 @@ def test_list_namespaces_pagination(spec_store):
 
 
 # --------------------------------------------------------------------------- #
-# Aerospike-only contract: semantic search is unsupported.
+# Aerospike-only contract: ``query=`` must be a vector search payload.
 # --------------------------------------------------------------------------- #
 
 
-def test_aerospike_rejects_semantic_search(client, namespace, truncate_sets):
-    """``AerospikeStore`` advertises no vector/embedding support and must say
-    so explicitly when a caller passes ``query=``. This pins that contract
-    so we don't accidentally start silently ignoring the parameter."""
+def test_aerospike_rejects_text_semantic_search(session, namespace, truncate_sets):
+    """``AerospikeStore`` vector search takes a list of floats (or an
+    ``{"embedding": [...], "metric": ...}`` dict). A raw text query is not a
+    supported form and must be rejected explicitly rather than silently
+    ignored."""
     truncate_sets((_AEROSPIKE_SET,))
-    store = AerospikeStore(client=client, namespace=namespace, set=_AEROSPIKE_SET)
-    with pytest.raises(NotImplementedError):
+    store = AerospikeStore(session=session, namespace=namespace, set=_AEROSPIKE_SET)
+    with pytest.raises(ValueError, match="Unsupported query type"):
         store.search(("anything",), query="hello world")

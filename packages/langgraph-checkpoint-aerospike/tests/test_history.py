@@ -9,35 +9,60 @@ _DEFAULT_CHECKPOINT_SETS = ("lg_cp", "lg_cp_w", "lg_cp_meta")
 
 def test_list_enumerates_via_secondary_index_mocked():
     """``list()`` queries the ``thread_id`` index and sorts newest-first."""
+    from aerospike_sdk import Exp
     from langgraph.checkpoint.aerospike import AerospikeSaver
 
-    mock_client = MagicMock()
+    mock_session = MagicMock()
     mock_query = MagicMock()
-    mock_client.query.return_value = mock_query
+    mock_session.query.return_value = mock_query
     rows = [
-        (None, None, {"checkpoint_ns": "ns1", "checkpoint_id": "c1", "ts": "2026-01-01T00:00:00"}),
-        (None, None, {"checkpoint_ns": "ns1", "checkpoint_id": "c3", "ts": "2026-01-03T00:00:00"}),
-        (None, None, {"checkpoint_ns": "ns1", "checkpoint_id": "c2", "ts": "2026-01-02T00:00:00"}),
+        MagicMock(
+            is_ok=True,
+            record=MagicMock(
+                bins={"checkpoint_ns": "ns1", "checkpoint_id": "c1", "ts": "2026-01-01T00:00:00"}
+            ),
+        ),
+        MagicMock(
+            is_ok=True,
+            record=MagicMock(
+                bins={"checkpoint_ns": "ns1", "checkpoint_id": "c3", "ts": "2026-01-03T00:00:00"}
+            ),
+        ),
+        MagicMock(
+            is_ok=True,
+            record=MagicMock(
+                bins={"checkpoint_ns": "ns1", "checkpoint_id": "c2", "ts": "2026-01-02T00:00:00"}
+            ),
+        ),
         # Different namespace for the same thread -> must be excluded.
-        (None, None, {"checkpoint_ns": "other", "checkpoint_id": "x", "ts": "2026-01-09T00:00:00"}),
+        MagicMock(
+            is_ok=True,
+            record=MagicMock(
+                bins={"checkpoint_ns": "other", "checkpoint_id": "x", "ts": "2026-01-09T00:00:00"}
+            ),
+        ),
     ]
-    mock_query.results.return_value = rows
+    mock_query.bins.return_value = mock_query
+    mock_query.where.return_value = mock_query
+    mock_query.execute.return_value = iter(rows)
 
-    saver = AerospikeSaver(client=mock_client, namespace="test", ttl={})
+    saver = AerospikeSaver(session=mock_session, namespace="test", ttl={})
     pairs = saver._list_checkpoint_ids("t1", "ns1")
 
     assert [cid for _, cid in pairs] == ["c3", "c2", "c1"]
-    mock_client.query.assert_called_once_with("test", "lg_cp")
+    mock_session.query.assert_called_once()
+    mock_query.bins.assert_called_once_with(["checkpoint_ns", "checkpoint_id", "ts"])
     mock_query.where.assert_called_once()
-    mock_query.select.assert_called_once_with("checkpoint_ns", "checkpoint_id", "ts")
+    expr = mock_query.where.call_args[0][0]
+    assert expr == Exp.eq(Exp.string_bin("thread_id"), Exp.string_val("t1"))
 
 
 @pytest.fixture
-def history_saver(aerospike_saver_cls, client, aerospike_namespace, truncate_sets):
+def history_saver(aerospike_saver_cls, session, aerospike_namespace, truncate_sets):
     """A saver with a plain TTL, truncated before/after each test."""
     truncate_sets(_DEFAULT_CHECKPOINT_SETS)
     saver = aerospike_saver_cls(
-        client=client,
+        session=session,
         namespace=aerospike_namespace,
         ttl={"default_ttl": 60},
     )

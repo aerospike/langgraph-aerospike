@@ -53,9 +53,9 @@ File map for `demo.py` (helps when following Steps 4–9):
 ```text
 demo.py
 ├── Constants:  AEROSPIKE_HOST, CHAT_TTL_MINUTES, THREAD_ID, ...
-├── Step 4:  _connect() -> Iterator[aerospike.Client]
-├── Step 5:  _build_checkpointer(client) -> AerospikeSaver
-├── Step 7:  _checkpoint_ttl_seconds(saver, client, config) -> int | None
+├── Step 4:  _connect() -> Iterator[SyncSession]
+├── Step 5:  _build_checkpointer(session) -> AerospikeSaver
+├── Step 7:  _checkpoint_ttl_seconds(saver, session, config) -> int | None
 ├── Step 6:  _say(graph, config, text) -> int
 └── main() -> int
     ├── Step 6:  wire graph + checkpointer, first _say() call
@@ -169,24 +169,27 @@ a parameter so `demo.py` can supply an Aerospike-backed one in Step 5.
 
 ## Step 4 — Connect to Aerospike
 
-**What this step does:** Before you can persist anything, connect a client to the
+**What this step does:** Before you can persist anything, connect a session to the
 Aerospike server. Connection settings live as typed constants at the top of
-`demo.py`. Wrap the client in a context manager so the connection is always
+`demo.py`. Wrap the session in a context manager so the connection is always
 closed, and turn a connection failure into a clear, actionable message.
 
 ```python
+from aerospike_sdk import Behavior, SyncSession
+from aerospike_sdk.sync import ClusterDefinition
+
 AEROSPIKE_HOST: str = "127.0.0.1"
 AEROSPIKE_PORT: int = 3000
 AEROSPIKE_NAMESPACE: str = "test"
 
 
 @contextmanager
-def _connect() -> Iterator[aerospike.Client]:
-    client = aerospike.client({"hosts": [(AEROSPIKE_HOST, AEROSPIKE_PORT)]}).connect()
+def _connect() -> Iterator[SyncSession]:
+    cluster = ClusterDefinition(AEROSPIKE_HOST, AEROSPIKE_PORT).connect()
     try:
-        yield client
+        yield cluster.create_session(Behavior.DEFAULT)
     finally:
-        client.close()
+        cluster.close()
 ```
 
 **In the code:** `demo.py`, marked `# === Step 4 ===` (`_connect()`), with the
@@ -207,9 +210,9 @@ CHAT_TTL_MINUTES: int = 1
 CHAT_REFRESH_ON_READ: bool = False
 
 
-def _build_checkpointer(client: aerospike.Client) -> AerospikeSaver:
+def _build_checkpointer(session: SyncSession) -> AerospikeSaver:
     return AerospikeSaver(
-        client=client,
+        session=session,
         namespace=AEROSPIKE_NAMESPACE,
         ttl={
             "default_ttl": CHAT_TTL_MINUTES,
@@ -254,8 +257,8 @@ def _say(graph: CompiledStateGraph, config: RunnableConfig, text: str) -> int:
 Inside `main()`, the graph and checkpointer are wired together:
 
 ```python
-with _connect() as client:
-    saver = _build_checkpointer(client)
+with _connect() as session:
+    saver = _build_checkpointer(session)
     graph = build_chat_graph(saver)
     count = _say(graph, config, "Hello, I need help with my order.")
 ```
@@ -273,9 +276,12 @@ read it back. Aerospike stores the remaining TTL in record **metadata**, so we
 locate the checkpoint record and read its `ttl` field directly.
 
 ```python
+from aerospike_sdk.exceptions import RecordNotFoundError
+
+
 def _checkpoint_ttl_seconds(
     saver: AerospikeSaver,
-    client: aerospike.Client,
+    session: SyncSession,
     config: RunnableConfig,
 ) -> int | None:
     tpl = saver.get_tuple(config)
@@ -284,11 +290,10 @@ def _checkpoint_ttl_seconds(
     conf = tpl.config["configurable"]
     key = saver._key_cp(conf["thread_id"], conf["checkpoint_ns"], conf["checkpoint_id"])
     try:
-        _, meta, _ = client.get(key)
-    except aerospike.exception.RecordNotFound:
+        record = session.get(key)
+    except RecordNotFoundError:
         return None
-    ttl = meta.get("ttl")
-    return ttl if isinstance(ttl, int) else None
+    return record.ttl
 ```
 
 **In the code:** `demo.py`, marked `# === Step 7 ===` (`_checkpoint_ttl_seconds()`).
